@@ -378,8 +378,19 @@ export class EstoqueSaidasRepository {
       data: { liberado_contagem: false },
     });
 
+    // Se está na contagem 3, não há próxima para liberar
+    if (contagem === 3) {
+      return await this.prisma.est_contagem.updateMany({
+        where: {
+          contagem_cuid: contagem_cuid,
+          contagem: contagem,
+        },
+        data: { liberado_contagem: false },
+      });
+    }
+
     if (divergencia) {
-      // Se divergência, libera a próxima contagem
+      // Se divergência, libera a próxima contagem (se existir)
       const contagemParaLiberar = contagem === 1 ? 2 : 3;
       const updated = await this.prisma.est_contagem.updateMany({
         where: {
