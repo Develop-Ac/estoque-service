@@ -136,4 +136,6 @@ export class CreateContagemDto {
   @ValidateNested({ each: true })
   @Type(() => CreateContagemItemDto)
   produtos!: CreateContagemItemDto[];
+
+  piso?: string;
 }

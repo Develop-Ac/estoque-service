@@ -134,7 +134,21 @@ export class EstoqueSaidasRepository {
       return { ...row, APLICACOES: txt };
     });
 
-    return sanitizedRows;
+    // Duplica os itens conforme solicitado
+    const result: EstoqueSaidaRow[] = [];
+    for (const item of sanitizedRows) {
+      result.push(item);
+      if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
+        // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
+        result.push({
+          ...item,
+          LOCALIZACAO: item.APLICACOES,
+          APLICACOES: null
+        });
+      }
+    }
+
+    return result;
   }
 
   toUtf8Text(val: unknown): string | null {
@@ -168,6 +182,7 @@ export class EstoqueSaidasRepository {
       contagem: tipoContagem,
       produtos,
       contagem_cuid,
+      piso
     } = createContagemDto;
 
     // limpa possíveis NULs no nome
@@ -215,7 +230,9 @@ export class EstoqueSaidasRepository {
           colaborador: usuario.id,
           contagem: tipoContagem,
           contagem_cuid: grupoContagem,
-          liberado_contagem: tipoContagem === 1, // true se contagem for 1, false para demais valores
+          // true se contagem for 1, false para demais valores
+          liberado_contagem: tipoContagem === 1, 
+          piso: String(piso),
         },
         include: {
           usuario: {
@@ -234,10 +251,16 @@ export class EstoqueSaidasRepository {
       if (itensExistentes.length === 0) {
         // Criar os itens associados ao contagem_cuid
         for (const produto of produtosSanitizados) {
-          const item = await tx.est_contagem_itens.create({
+            // Extrai apenas a data no formato yyyy-mm-dd
+            const dataStr = produto.DATA instanceof Date
+            ? produto.DATA.toISOString().slice(0, 10)
+            : String(produto.DATA).slice(0, 10);
+
+            const item = await tx.est_contagem_itens.create({
             data: {
+              identificador_item: `${produto.COD_PRODUTO}-${dataStr}`, // ID único composto
               contagem_cuid: grupoContagem,
-              data: produto.DATA, // já saneado p/ Date válido
+              data: produto.DATA, // salva apenas yyyy-mm-dd
               cod_produto: produto.COD_PRODUTO,
               desc_produto: produto.DESC_PRODUTO ?? '',       // strings limpas (sem 0x00) ou null
               mar_descricao: produto.MAR_DESCRICAO,
@@ -250,7 +273,7 @@ export class EstoqueSaidasRepository {
               estoque: produto.ESTOQUE,
               reserva: produto.RESERVA,
             },
-          });
+            });
           itens.push(item);
         }
       } else {
@@ -511,12 +534,12 @@ export class EstoqueSaidasRepository {
     item_id: string;
     estoque: number;
     contado: number;
+    identificador_item?: string;
   }) {
     // Primeiro, verifica se já existe um log com o mesmo contagem_id e item_id
     const existingLog = await this.prisma.est_contagem_log.findFirst({
       where: {
-        contagem_id: createLogData.contagem_id,
-        item_id: createLogData.item_id,
+        identificador_item: createLogData.identificador_item
       }
     });
 
@@ -529,7 +552,7 @@ export class EstoqueSaidasRepository {
         data: {
           usuario_id: createLogData.usuario_id,
           estoque: createLogData.estoque,
-          contado: createLogData.contado,
+          contado: createLogData.contado + existingLog.contado, // acumula o contado
           created_at: new Date(), // Atualiza também a data
         }
       });
@@ -543,6 +566,7 @@ export class EstoqueSaidasRepository {
           item_id: createLogData.item_id,
           estoque: createLogData.estoque,
           contado: createLogData.contado,
+          identificador_item: createLogData.identificador_item
         }
       });
       return log;
