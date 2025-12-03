@@ -341,15 +341,11 @@ export class EstoqueSaidasRepository {
 
   async updateItemConferir(identificador_item: string, conferir: boolean, itemId: string) {
 
-    console.log('updateItemConferir called with:', { identificador_item, conferir });
- 
     const item = await this.prisma.est_contagem_log.findFirst({
       where: { identificador_item: identificador_item }
     });
     
     const conferirValue = item?.estoque === item?.contado
-
-    console.log('updateItemConferir:', { itemId });
 
     // Atualiza somente o campo 'conferir' do item de contagem
     const updated = await this.prisma.est_contagem_itens.update({
