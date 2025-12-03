@@ -537,29 +537,42 @@ export class EstoqueSaidasRepository {
     identificador_item?: string;
   }) {
     // Primeiro, verifica se já existe um log com o mesmo contagem_id e item_id
-    const existingLog = await this.prisma.est_contagem_log.findFirst({
+    const existingLog = await this.prisma.est_contagem_log.findMany({
       where: {
-        identificador_item: createLogData.identificador_item
+        identificador_item: createLogData.identificador_item,
+        contagem_id: createLogData.contagem_id,
       }
     });
 
     if (existingLog) {
       // Se existe, atualiza o registro existente
-      const updatedLog = await this.prisma.est_contagem_log.update({
+      const updatedLog1 = await this.prisma.est_contagem_log.update({
         where: {
-          id: existingLog.id
+          id: existingLog[0].id
         },
         data: {
           usuario_id: createLogData.usuario_id,
           estoque: createLogData.estoque,
-          contado: createLogData.contado + existingLog.contado, // acumula o contado
+          contado: createLogData.contado + existingLog[0].contado, // acumula o contado
           created_at: new Date(), // Atualiza também a data
         }
       });
-      return updatedLog;
+
+      const updatedLog2 = await this.prisma.est_contagem_log.update({
+        where: {
+          id: existingLog[1].id
+        },
+        data: {
+          usuario_id: createLogData.usuario_id,
+          estoque: createLogData.estoque,
+          contado: createLogData.contado + existingLog[1].contado, // acumula o contado
+          created_at: new Date(), // Atualiza também a data
+        }
+      });
+      return updatedLog1;
     } else {
       // Se não existe, cria um novo registro
-      const log = await this.prisma.est_contagem_log.create({
+      const log1 = await this.prisma.est_contagem_log.create({
         data: {
           contagem_id: createLogData.contagem_id,
           usuario_id: createLogData.usuario_id,
@@ -569,7 +582,7 @@ export class EstoqueSaidasRepository {
           identificador_item: createLogData.identificador_item
         }
       });
-      return log;
+      return log1;
     }
   }
 
