@@ -7,4 +7,10 @@ export class UpdateConferirDto {
     type: 'boolean'
   })
   conferir!: boolean;
+  @ApiProperty({
+    description: 'Identificador único do item',
+    example: 'abc123',
+    type: 'string'
+  })
+  itemId!: string;
 }

@@ -34,8 +34,8 @@ export class EstoqueSaidasService {
     }));
   }
 
-  async updateItemConferir(itemId: string, conferir: boolean) {
-    return this.repo.updateItemConferir(itemId, conferir);
+  async updateItemConferir(identificador_item: string, conferir: boolean, itemId: string) {
+    return this.repo.updateItemConferir(identificador_item, conferir, itemId,);
   }
 
   async getEstoqueProduto(codProduto: number, empresa?: string): Promise<ConferirEstoqueResponseDto | null> {

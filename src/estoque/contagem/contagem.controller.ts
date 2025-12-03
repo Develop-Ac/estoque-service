@@ -385,7 +385,7 @@ export class EstoqueSaidasController {
     }
   })
   async updateItemConferir(@Param('id') id: string, @Body() body: UpdateConferirDto) {
-    return this.service.updateItemConferir(id, body.conferir);
+    return this.service.updateItemConferir(id, body.conferir, body.itemId);
   }
 
   @Get('conferir/:cod_produto')
