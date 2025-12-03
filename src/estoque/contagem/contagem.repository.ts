@@ -540,49 +540,55 @@ export class EstoqueSaidasRepository {
     const existingLog = await this.prisma.est_contagem_log.findMany({
       where: {
         identificador_item: createLogData.identificador_item,
-        contagem_id: createLogData.contagem_id,
       }
     });
 
-    if (existingLog) {
-      // Se existe, atualiza o registro existente
-      const updatedLog1 = await this.prisma.est_contagem_log.update({
+    console.log('existingLog:', existingLog);
+
+    if (Array.isArray(existingLog) && existingLog.length === 1) {
+      const current = existingLog[0];
+
+      const contadoAtual = Number.isFinite(createLogData.contado)
+        ? createLogData.contado
+        : 0;
+
+      const updatedLog = await this.prisma.est_contagem_log.update({
         where: {
-          id: existingLog[0].id
+          id: current.id,
         },
         data: {
           usuario_id: createLogData.usuario_id,
           estoque: createLogData.estoque,
-          contado: createLogData.contado + existingLog[0].contado, // acumula o contado
-          created_at: new Date(), // Atualiza também a data
-        }
+          contado: current.contado + contadoAtual, // só usa o existente
+          created_at: new Date(),
+        },
       });
 
-      const updatedLog2 = await this.prisma.est_contagem_log.update({
-        where: {
-          id: existingLog[1].id
-        },
-        data: {
-          usuario_id: createLogData.usuario_id,
-          estoque: createLogData.estoque,
-          contado: createLogData.contado + existingLog[1].contado, // acumula o contado
-          created_at: new Date(), // Atualiza também a data
-        }
-      });
-      return updatedLog1;
-    } else {
-      // Se não existe, cria um novo registro
-      const log1 = await this.prisma.est_contagem_log.create({
+      const log = await this.prisma.est_contagem_log.create({
         data: {
           contagem_id: createLogData.contagem_id,
           usuario_id: createLogData.usuario_id,
           item_id: createLogData.item_id,
           estoque: createLogData.estoque,
-          contado: createLogData.contado,
-          identificador_item: createLogData.identificador_item
-        }
+          contado: current.contado + contadoAtual, // mesma lógica, se for isso mesmo
+          identificador_item: createLogData.identificador_item,
+        },
       });
-      return log1;
+
+      return log;
+    }else {
+      // Se não existe, cria um novo registro
+      const log = await this.prisma.est_contagem_log.create({
+      data: {
+        contagem_id: createLogData.contagem_id,
+        usuario_id: createLogData.usuario_id,
+        item_id: createLogData.item_id,
+        estoque: createLogData.estoque,
+        contado: createLogData.contado,
+        identificador_item: createLogData.identificador_item
+      }
+      });
+      return log;
     }
   }
 
