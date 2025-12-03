@@ -550,8 +550,6 @@ export class EstoqueSaidasRepository {
       }
     });
 
-    console.log('existingLog:', existingLog);
-
     if (Array.isArray(existingLog) && existingLog.length === 1) {
       const current = existingLog[0];
 
