@@ -340,10 +340,17 @@ export class EstoqueSaidasRepository {
   }
 
   async updateItemConferir(itemId: string, conferir: boolean) {
+ 
+    const item = await this.prisma.est_contagem_log.findUnique({
+      where: { id: itemId }
+    });
+    
+    const conferirValue = item?.estoque === item?.contado
+
     // Atualiza somente o campo 'conferir' do item de contagem
     const updated = await this.prisma.est_contagem_itens.update({
       where: { id: itemId },
-      data: { conferir }
+      data: { conferir: conferirValue },
     });
 
     return updated;
@@ -548,10 +555,6 @@ export class EstoqueSaidasRepository {
     if (Array.isArray(existingLog) && existingLog.length === 1) {
       const current = existingLog[0];
 
-      const contadoAtual = Number.isFinite(createLogData.contado)
-        ? createLogData.contado
-        : 0;
-
       const updatedLog = await this.prisma.est_contagem_log.update({
         where: {
           id: current.id,
@@ -559,7 +562,7 @@ export class EstoqueSaidasRepository {
         data: {
           usuario_id: createLogData.usuario_id,
           estoque: createLogData.estoque,
-          contado: current.contado + contadoAtual, // só usa o existente
+          contado: current.contado + createLogData.contado, // só usa o existente
           created_at: new Date(),
         },
       });
@@ -570,7 +573,7 @@ export class EstoqueSaidasRepository {
           usuario_id: createLogData.usuario_id,
           item_id: createLogData.item_id,
           estoque: createLogData.estoque,
-          contado: current.contado + contadoAtual, // mesma lógica, se for isso mesmo
+          contado: current.contado + createLogData.contado, // mesma lógica, se for isso mesmo
           identificador_item: createLogData.identificador_item,
         },
       });
