@@ -577,7 +577,61 @@ export class EstoqueSaidasRepository {
       });
 
       return log;
-    }else {
+    } else if (Array.isArray(existingLog) && existingLog.length === 3) {
+      const current = existingLog[2];
+
+      const updatedLog = await this.prisma.est_contagem_log.update({
+        where: {
+          id: current.id,
+        },
+        data: {
+          usuario_id: createLogData.usuario_id,
+          estoque: createLogData.estoque,
+          contado: current.contado + createLogData.contado, // só usa o existente
+          created_at: new Date(),
+        },
+      });
+
+      const log = await this.prisma.est_contagem_log.create({
+        data: {
+          contagem_id: createLogData.contagem_id,
+          usuario_id: createLogData.usuario_id,
+          item_id: createLogData.item_id,
+          estoque: createLogData.estoque,
+          contado: current.contado + createLogData.contado, // mesma lógica, se for isso mesmo
+          identificador_item: createLogData.identificador_item,
+        },
+      });
+
+      return log;
+    }else if (Array.isArray(existingLog) && existingLog.length === 5) {
+      const current = existingLog[4];
+
+      const updatedLog = await this.prisma.est_contagem_log.update({
+        where: {
+          id: current.id,
+        },
+        data: {
+          usuario_id: createLogData.usuario_id,
+          estoque: createLogData.estoque,
+          contado: current.contado + createLogData.contado, // só usa o existente
+          created_at: new Date(),
+        },
+      });
+
+      const log = await this.prisma.est_contagem_log.create({
+        data: {
+          contagem_id: createLogData.contagem_id,
+          usuario_id: createLogData.usuario_id,
+          item_id: createLogData.item_id,
+          estoque: createLogData.estoque,
+          contado: current.contado + createLogData.contado, // mesma lógica, se for isso mesmo
+          identificador_item: createLogData.identificador_item,
+        },
+      });
+
+      return log;
+    } else {
       // Se não existe, cria um novo registro
       const log = await this.prisma.est_contagem_log.create({
       data: {
