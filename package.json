@@ -74,7 +74,9 @@
       "@prisma/client"
     ]
   },
-  "overrides": {},
+  "overrides": {
+    "canvas": "^2.11.2"
+  },
   "resolutions": {},
   "postinstall": "prisma generate"
 }
