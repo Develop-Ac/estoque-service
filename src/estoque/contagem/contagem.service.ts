@@ -9,7 +9,7 @@ import { LogResponseDto } from './dto/log-response.dto';
 
 @Injectable()
 export class EstoqueSaidasService {
-  constructor(private readonly repo: EstoqueSaidasRepository) {}
+  constructor(private readonly repo: EstoqueSaidasRepository) { }
 
   async listarSaidas(filters: {
     data_inicial: string;
@@ -63,5 +63,9 @@ export class EstoqueSaidasService {
 
   async createLog(createLogDto: CreateLogDto): Promise<LogResponseDto> {
     return this.repo.createLog(createLogDto);
+  }
+
+  async getLogsByContagem(contagemId: string) {
+    return this.repo.getLogsByContagem(contagemId);
   }
 }

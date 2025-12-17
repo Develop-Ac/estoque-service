@@ -775,18 +775,17 @@ export class EstoqueSaidasRepository {
 
     if (existingLog) {
       // Se já existe, ATUALIZA o valor (substitui)
-      // Assumimos que o frontend envia o valor TOTAL da contagem daquele usuário, não um delta.
       const log = await this.prisma.est_contagem_log.update({
         where: { id: existingLog.id },
         data: {
           estoque: createLogData.estoque,
           contado: createLogData.contado,
-          created_at: new Date(), // Atualiza data para repontar que houve alteração
+          created_at: new Date(),
         },
       });
       return log;
     } else {
-      // Se não existe, cria um novo registro para este usuário
+      // Se não existe, cria um novo registro
       const log = await this.prisma.est_contagem_log.create({
         data: {
           contagem_id: createLogData.contagem_id,
@@ -799,6 +798,32 @@ export class EstoqueSaidasRepository {
       });
       return log;
     }
+  }
+
+  async getLogsByContagem(contagemId: string) {
+    return await this.prisma.est_contagem_log.findMany({
+      where: {
+        contagem_id: contagemId
+      },
+      include: {
+        item: {
+          select: {
+            cod_produto: true,
+            desc_produto: true,
+            localizacao: true
+          }
+        },
+        usuario: {
+          select: {
+            nome: true,
+            codigo: true
+          }
+        }
+      },
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
   }
 
   private sanitizeData(data: any): any {
@@ -828,7 +853,6 @@ export class EstoqueSaidasRepository {
   }
 
   async createContagemItem(data: Prisma.est_contagem_itensCreateInput) {
-    // Aplicar sanitização antes da criação
     const sanitizedData = this.sanitizeData(data);
     return this.prisma.est_contagem_itens.create({ data: sanitizedData });
   }

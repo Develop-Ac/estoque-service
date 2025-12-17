@@ -1,9 +1,9 @@
 import { Body, Controller, Get, Post, Query, Param, Put, BadRequestException } from '@nestjs/common';
-import { 
-  ApiTags, 
-  ApiOperation, 
-  ApiQuery, 
-  ApiOkResponse, 
+import {
+  ApiTags,
+  ApiOperation,
+  ApiQuery,
+  ApiOkResponse,
   ApiBadRequestResponse,
   ApiInternalServerErrorResponse,
   ApiExtraModels,
@@ -26,7 +26,7 @@ import { LogResponseDto } from './dto/log-response.dto';
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
 @Controller('contagem')
 export class EstoqueSaidasController {
-  constructor(private readonly service: EstoqueSaidasService) {}
+  constructor(private readonly service: EstoqueSaidasService) { }
 
   @Get()
   @ApiOperation({
@@ -265,14 +265,14 @@ export class EstoqueSaidasController {
         liberado_contagem: true
       },
       {
-        id: 'clx1234567890type2', 
+        id: 'clx1234567890type2',
         contagem: 2,
         contagem_cuid: 'clx1234567890group',
         liberado_contagem: false
       },
       {
         id: 'clx1234567890type3',
-        contagem: 3, 
+        contagem: 3,
         contagem_cuid: 'clx1234567890group',
         liberado_contagem: false
       }
@@ -430,7 +430,7 @@ export class EstoqueSaidasController {
     }
   })
   async getEstoqueProduto(
-    @Param('cod_produto') codProduto: string, 
+    @Param('cod_produto') codProduto: string,
     @Query('empresa') empresa?: string
   ): Promise<ConferirEstoqueResponseDto | null> {
     const codProdutoNum = parseInt(codProduto, 10);
@@ -475,5 +475,26 @@ export class EstoqueSaidasController {
   })
   async createLog(@Body() createLogDto: CreateLogDto): Promise<LogResponseDto> {
     return await this.service.createLog(createLogDto);
+  }
+
+  @Get('logs/:contagem_id')
+  @ApiOperation({
+    summary: 'Listar logs de uma contagem',
+    description: 'Retorna todos os logs de contagem para um ID de contagem específico, incluindo detalhes do item (localização) e usuário.'
+  })
+  @ApiParam({
+    name: 'contagem_id',
+    description: 'ID da contagem',
+    example: 'clx1234567890abcdef',
+    type: 'string'
+  })
+  @ApiOkResponse({
+    description: 'Lista de logs retornada com sucesso',
+    type: LogResponseDto,
+    isArray: true
+  })
+  async getLogsByContagem(@Param('contagem_id') contagemId: string) {
+    const logs = await this.service.getLogsByContagem(contagemId);
+    return { logs }; // Wrap in object to match frontend expectation { logs: [] }
   }
 }
