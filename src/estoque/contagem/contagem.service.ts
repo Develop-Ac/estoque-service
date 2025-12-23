@@ -61,6 +61,10 @@ export class EstoqueSaidasService {
     return this.repo.getAllContagens();
   }
 
+  async getLogsAgregadosPorContagem(contagemId: string) {
+    return this.repo.getLogsAgregadosPorContagem(contagemId);
+  }
+
   async createLog(createLogDto: CreateLogDto): Promise<LogResponseDto> {
     return this.repo.createLog(createLogDto);
   }

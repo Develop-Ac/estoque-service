@@ -42,6 +42,47 @@ function asNumberOrZero(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Função auxiliar para extrair e validar locações
+function formatAndValidateLocation(text: string | null): string | null {
+  if (!text) return null;
+
+  const upperApp = text.toUpperCase();
+
+  // 1. Regras Especiais (Prioridade Alta)
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR)
+  // Aceita digitos OU a palavra especifica BEBEDOR (ou pode ser genérico \w+)
+  const boxMatch = upperApp.match(/\bBOX\s*(?:\d+|BEBEDOR)\b/);
+  if (boxMatch) {
+    return `A-${boxMatch[0]}`;
+  }
+
+  // BOQUETA
+  if (upperApp.includes('BOQUETA')) {
+    return 'A-BOQUETA';
+  }
+
+  // CAIXA ESCADA / CX ESCADA
+  if (upperApp.match(/\b(?:CX|CAIXA)\s*ESCADA\b/)) {
+    return 'A-CX ESCADA';
+  }
+
+
+
+  // 3. Regra do Padrão: Letra + 2-4 Números + Letra + 1-2 Números
+  // Ex: A1204E02, C16D1
+  // Regex: \b[A-Z]\d{2,4}[A-Z]\d{1,2}\b (Case insensitive)
+  const codeRegex = /\b[A-Z]\d{2,4}[A-Z]\d{1,2}\b/gi;
+  const matches = text.match(codeRegex);
+
+  if (matches && matches.length > 0) {
+    // Junta todos os códigos encontrados com espaço
+    return matches.join(' ');
+  }
+
+  // Se não caiu em nenhuma regra, considera lixo e retorna null
+  return null;
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -124,20 +165,40 @@ export class EstoqueSaidasRepository {
     const rows = await this.oq.query<EstoqueSaidaRow>(outerSql, {}, { timeout: 300_000 });
 
     const sanitizedRows = (rows ?? []).map((row, i) => {
-      let txt: string | null;
+      let txtApp: string | null;
+      let txtLoc: string | null;
+
       try {
-        txt = this.toUtf8Text((row as any).APLICACOES);
+        // APLICA EXTRAÇÃO INTELIGENTE para APLICACOES:
+        // Se for "HB20", retorna null. Se for "A1204E02", retorna "A1204E02".
+        // Se for "BOX 03", retorna "A-BOX 03".
+        txtApp = formatAndValidateLocation(this.toUtf8Text((row as any).APLICACOES));
       } catch (e) {
         console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
-        txt = null;
+        txtApp = null;
       }
-      return { ...row, APLICACOES: txt };
+
+      try {
+        // APLICA FORMATAÇÃO + EXTRAÇÃO para LOCALIZACAO:
+        // O usuário quer que "BOX 03" vire "A-BOX 03" também no campo principal.
+        // Se a função retornar null (ex: texto irrelevante ou formato desconhecido),
+        // mantemos o valor original do banco (fallback), pois LOCALIZACAO é campo mestre.
+        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+        const formattedLoc = formatAndValidateLocation(rawLoc);
+        txtLoc = formattedLoc ?? rawLoc; // Se não validar/formatar, usa o original (confiança no ERP)
+      } catch (e) {
+        console.error('Falha ao converter LOCALIZACAO na linha', i, row?.COD_PRODUTO, e);
+        txtLoc = (row as any).LOCALIZACAO;
+      }
+
+      return { ...row, APLICACOES: txtApp, LOCALIZACAO: txtLoc };
     });
 
     // Duplica os itens conforme solicitado
     const result: EstoqueSaidaRow[] = [];
     for (const item of sanitizedRows) {
       result.push(item);
+      // Só cria o segundo item se APLICACOES for válido (não nulo)
       if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
         // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
         result.push({
@@ -176,6 +237,8 @@ export class EstoqueSaidasRepository {
     }
   }
 
+
+
   async createContagem(createContagemDto: CreateContagemDto) {
     const {
       colaborador: nomeColaboradorRaw,
@@ -212,10 +275,13 @@ export class EstoqueSaidasRepository {
         MAR_DESCRICAO: asCleanNullableText(p.MAR_DESCRICAO),
         REF_FABRICANTE: asCleanNullableText(p.REF_FABRICANTE),
         REF_FORNECEDOR: asCleanNullableText(p.REF_FORNECEDOR),
-        LOCALIZACAO: asCleanNullableText(p.LOCALIZACAO),
+        LOCALIZACAO: (function () {
+          const raw = asCleanNullableText(p.LOCALIZACAO);
+          return formatAndValidateLocation(raw) ?? raw; // Formata se for especial, senão mantém original
+        })(),
         UNIDADE: asCleanNullableText(p.UNIDADE),
-        // APLICACOES costuma vir com bytes binários; limpamos NUL e convertemos:
-        APLICACOES: asCleanNullableText(p.APLICACOES),
+        // EXTRAÇÃO INTELIGENTE DE APLICAÇÕES
+        APLICACOES: formatAndValidateLocation(asCleanNullableText(p.APLICACOES)),
         QTDE_SAIDA: asNumberOrZero(p.QTDE_SAIDA),
         ESTOQUE: asNumberOrZero(p.ESTOQUE),
         RESERVA: asNumberOrZero(p.RESERVA),
@@ -454,11 +520,48 @@ export class EstoqueSaidasRepository {
 
     const temDivergenciaNumerica = realSum !== estoqueSnapshot;
 
-    let finalConferirValue = temDivergenciaNumerica;
+    // --- LÓGICA DE VALIDAÇÃO HÍBRIDA (FRONT x BACK) ---
+    // 1. Buscar todos os itens que compõem este produto (mesmo identificador)
+    const groupItems = await this.prisma.est_contagem_itens.findMany({
+      where: {
+        identificador_item: identificador_item,
+        contagem_cuid: parentContagem?.contagem_cuid ?? ''
+      }
+    });
 
-    // LÓGICA SIMPLIFICADA:
-    // Se a soma não bate com o estoque, é divergência (conferir = true).
-    finalConferirValue = temDivergenciaNumerica;
+    let finalConferirValue = temDivergenciaNumerica; // Default: Back decide (segurança)
+    let trustFront = false;
+
+    if (groupItems.length <= 1) {
+      // CASO 1: Locação Única -> CONFIA NO FRONT
+      // O usuário sabe o que está vendo. Se ele marcou que tem divergência, tem. Se não, não.
+      trustFront = true;
+    } else {
+      // CASO 2: Multilocação
+      // Verificamos se TODOS os locais já foram contados nesta rodada.
+      // Se ainda falta contagem em algum local, não temos como validar o total,
+      // então confiamos no status provisório que o front mandar.
+
+      const countedItemIds = new Set(logsRelevantes.map(l => l.item_id));
+      const allLocationsCounted = groupItems.every(item => countedItemIds.has(item.id));
+
+      if (!allLocationsCounted) {
+        // Ainda não acabou de contar todos os locais -> CONFIA NO FRONT (Status Provisório)
+        trustFront = true;
+      } else {
+        // Todos contados -> VALIDAÇÃO RIGOROSA DO BACK
+        // Somamos tudo e vemos se bate com o estoque total.
+        trustFront = false;
+      }
+    }
+
+    if (trustFront) {
+      console.log(`[DEBUG] HybridValidation: Trusting Frontend value=${conferir}`);
+      finalConferirValue = conferir;
+    } else {
+      console.log(`[DEBUG] HybridValidation: Enforcing Backend value=${temDivergenciaNumerica}`);
+      finalConferirValue = temDivergenciaNumerica;
+    }
 
     // ATUALIZAÇÃO EM MASSA:
     const updated = await this.prisma.est_contagem_itens.updateMany({
@@ -627,8 +730,16 @@ export class EstoqueSaidasRepository {
     }
 
     if (temDivergenciaReal) {
+      console.log(`[DEBUG] updateLiberadoContagem: CUID=${contagem_cuid}, Contagem=${contagem} (${typeof contagem}), Divergencia=${divergencia}`);
+
+      // GARANTIA EXTRA DE TIPO
+      const contagemNum = Number(contagem);
+
       // Se divergência, libera a próxima contagem (se existir)
-      const contagemParaLiberar = contagem === 1 ? 2 : 3;
+      // Lógica Paranóica: Se for 1 vai pra 2. Se for 2 vai pra 3.
+      const contagemParaLiberar = contagemNum === 1 ? 2 : 3;
+
+      console.log(`[DEBUG] Próxima contagem calculada: ${contagemParaLiberar}`);
 
       // Buscar IDs das contagens que serão liberadas para evitar update desnecessário se não existir
       const contagensAlvo = await this.prisma.est_contagem.findMany({
@@ -638,6 +749,8 @@ export class EstoqueSaidasRepository {
         },
         select: { id: true }
       });
+
+      console.log(`[DEBUG] Contagens alvo encontradas: ${contagensAlvo.length}`);
 
       let updatedCount = 0;
       if (contagensAlvo.length > 0) {
@@ -649,6 +762,7 @@ export class EstoqueSaidasRepository {
           data: { liberado_contagem: true },
         });
         updatedCount = updateResult.count;
+        console.log(`[DEBUG] Update realizado. Linhas afetadas: ${updatedCount}`);
       }
 
       // Se estamos liberando a próxima contagem, precisamos também marcar os ITENS que deram divergência
@@ -714,6 +828,65 @@ export class EstoqueSaidasRepository {
     }));
 
     return contagensComItens;
+  }
+
+  async getLogsAgregadosPorContagem(contagemId: string) {
+    // 1. Buscar a contagem para obter o CUID
+    const contagem = await this.prisma.est_contagem.findUnique({
+      where: { id: contagemId },
+      select: { contagem_cuid: true }
+    });
+
+    if (!contagem || !contagem.contagem_cuid) {
+      return [];
+    }
+
+    // 2. Buscar os itens associados a este CUID
+    const itens = await this.prisma.est_contagem_itens.findMany({
+      where: { contagem_cuid: contagem.contagem_cuid },
+      select: { identificador_item: true }
+    });
+
+    // Extrair identificadores únicos
+    const identificadores = [...new Set(itens.map(i => i.identificador_item).filter(Boolean))];
+
+    if (identificadores.length === 0) {
+      return [];
+    }
+
+    // 2. Buscar TODOS os logs que referenciam esses identificadores
+    //    Isso traz logs dessa contagem E de outras contagens (irmãs)
+    const logs = await this.prisma.est_contagem_log.findMany({
+      where: {
+        identificador_item: {
+          in: identificadores as string[]
+        }
+      },
+      include: {
+        item: {
+          select: {
+            cod_produto: true,
+            desc_produto: true,
+            localizacao: true
+          }
+        },
+        usuario: {
+          select: {
+            nome: true
+          }
+        },
+        contagem: {
+          select: {
+            contagem: true // Importante para saber se é Round 1, 2 ou 3
+          }
+        }
+      },
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
+
+    return logs;
   }
 
   async getAllContagens() {

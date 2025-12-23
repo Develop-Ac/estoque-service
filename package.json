@@ -19,7 +19,6 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand"
   },
   "dependencies": {
-    "@alexssmusica/node-pdf-nfe": "^1.2.3",
     "@aws-sdk/client-s3": "^3.922.0",
     "@aws-sdk/s3-request-presigner": "^3.922.0",
     "@fastify/swagger": "^9.5.2",
@@ -43,7 +42,6 @@
     "helmet": "^7.2.0",
     "jspdf": "^3.0.3",
     "mssql": "^12.0.0",
-    "node-sped-pdf": "^1.0.65",
     "pdfkit": "^0.17.2",
     "pg": "^8.16.3",
     "prisma": "^5.19.0",
@@ -73,9 +71,6 @@
     "onlyBuiltDependencies": [
       "@prisma/client"
     ]
-  },
-  "overrides": {
-    "canvas": "^2.11.2"
   },
   "resolutions": {},
   "postinstall": "prisma generate"

@@ -1,10 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsIn, IsNotEmpty, IsString } from 'class-validator';
+import { IsBoolean, IsIn, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class UpdateLiberadoContagemDto {
-  divergencia(contagem_cuid: string, contagem: number, divergencia: any) {
-    throw new Error('Method not implemented.');
-  }
   @ApiProperty({
     description: 'Identificador comum do grupo de contagens',
     example: 'clx1234567890group'
@@ -20,4 +17,13 @@ export class UpdateLiberadoContagemDto {
   })
   @IsIn([1, 2])
   contagem!: number;
+
+  @ApiProperty({
+    description: 'Indica se houve divergência na contagem',
+    example: true,
+    required: false
+  })
+  @IsBoolean()
+  @IsOptional()
+  divergencia?: boolean;
 }

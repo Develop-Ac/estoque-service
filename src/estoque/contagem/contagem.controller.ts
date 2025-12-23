@@ -348,7 +348,7 @@ export class EstoqueSaidasController {
     }
   })
   async updateLiberadoContagem(@Body() body: UpdateLiberadoContagemDto) {
-    return this.service.updateLiberadoContagem(body.contagem_cuid, body.contagem, !!body.divergencia);
+    return this.service.updateLiberadoContagem(body.contagem_cuid, Number(body.contagem), !!body.divergencia);
   }
 
   @Put('item/:id')
@@ -438,6 +438,23 @@ export class EstoqueSaidasController {
       throw new BadRequestException('Código do produto deve ser um número válido');
     }
     return this.service.getEstoqueProduto(codProdutoNum, empresa);
+  }
+
+  @Get('logs-agregados/:id')
+  @ApiOperation({
+    summary: 'Buscar logs agregados de uma contagem',
+    description: 'Retorna TODOS os logs associados aos itens desta contagem, cruzando pelo identificador_item. Isso permite ver dados de contagens irmãs (mesmo produto, usuários diferentes) mesmo que tenham CUIDs diferentes.'
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'ID da contagem',
+    type: 'string'
+  })
+  @ApiOkResponse({
+    description: 'Logs agregados retornados com sucesso'
+  })
+  async getLogsAgregados(@Param('id') id: string) {
+    return this.service.getLogsAgregadosPorContagem(id);
   }
 
   @Post('log')
