@@ -26,4 +26,13 @@ export class UpdateLiberadoContagemDto {
   @IsBoolean()
   @IsOptional()
   divergencia?: boolean;
+
+  @ApiProperty({
+    description: 'Lista de IDs de itens que falharam na validação anterior e devem ser reprocessados',
+    example: ['clx123...', 'clx456...'],
+    required: false
+  })
+  @IsOptional()
+  @IsString({ each: true })
+  itensParaRevalidar?: string[];
 }
