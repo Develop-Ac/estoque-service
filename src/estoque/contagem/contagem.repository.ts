@@ -518,7 +518,47 @@ export class EstoqueSaidasRepository {
     console.log(`[DEBUG] updateItemConferir: SomaReal=${realSum} vs EstoqueSnapshot=${estoqueSnapshot}`);
     console.log(`[DEBUG] updateItemConferir: Divergencia? ${realSum !== estoqueSnapshot}`);
 
-    const temDivergenciaNumerica = realSum !== estoqueSnapshot;
+    // --- LÓGICA DE VALIDAÇÃO COM OPENQUERY ---
+    // MODIFICADO: Buscar estoque REAL realtime para não depender do snapshot
+    // Se falhar a busca (null), usamos o snapshot como fallback
+    let estoqueRealtime = estoqueSnapshot;
+
+    try {
+      const produtoEstoque = await this.getEstoqueProduto(contagemItem.cod_produto);
+      if (produtoEstoque) {
+        estoqueRealtime = produtoEstoque.ESTOQUE;
+        console.log(`[DEBUG] updateItemConferir: Estoque Realtime Obtido=${estoqueRealtime} (Snapshot era ${estoqueSnapshot})`);
+
+        // NOVO: Persistir este estoque atualizado no item para "congelar" a referência
+        // Isso evita que na finalização do grupo precisemos buscar de novo.
+        await this.prisma.est_contagem_itens.update({
+          where: { id: itemId },
+          data: { estoque: estoqueRealtime }
+        });
+
+        // CORREÇÃO: Atualizar também os logs existentes para este item/contagem com o estoque real
+        // Caso contrário, eles ficam com 0 se o front mandou 0 inicialmente.
+        const logsToUpdate = logsRelevantes.map(l => l.id);
+        if (logsToUpdate.length > 0) {
+          await this.prisma.est_contagem_log.updateMany({
+            where: { id: { in: logsToUpdate } },
+            data: { estoque: estoqueRealtime }
+          });
+          console.log(`[DEBUG] Atualizado estoque=${estoqueRealtime} em ${logsToUpdate.length} logs relacionados.`);
+        }
+      }
+    } catch (e) {
+      console.error('[DEBUG] Falha ao buscar estoque realtime', e);
+    }
+
+    // Recalcular divergência com o estoque atualizado (Realtime ou Snapshot se falhou)
+    const temDivergenciaNumerica = realSum !== estoqueRealtime;
+
+    console.log(`[DEBUG] updateItemConferir: Divergencia Final? ${temDivergenciaNumerica} (RealSum=${realSum} vs EstoqueRef=${estoqueRealtime})`);
+
+    // Se o usuário mandou "conferir: false", mas matematicamente tem divergência,
+    // precisamos ter cuidado. 
+    // O sistema original forçava o Back a decidir.
 
     // --- LÓGICA DE VALIDAÇÃO HÍBRIDA (FRONT x BACK) ---
     // 1. Buscar todos os itens que compõem este produto (mesmo identificador)
@@ -616,8 +656,34 @@ export class EstoqueSaidasRepository {
   async updateLiberadoContagem(
     contagem_cuid: string,
     contagem: number,
-    divergencia: boolean
+    divergencia: boolean,
+    itensParaRevalidar: string[] = []
   ) {
+    // 0. Revalidação Seletiva de Itens Falhos
+    if (itensParaRevalidar && itensParaRevalidar.length > 0) {
+      console.log(`[DEBUG] Revalidando ${itensParaRevalidar.length} itens que falharam anteriormente...`);
+      for (const itemId of itensParaRevalidar) {
+        try {
+          const item = await this.prisma.est_contagem_itens.findUnique({ where: { id: itemId } });
+          if (item) {
+            const produtoEstoque = await this.getEstoqueProduto(item.cod_produto);
+            if (produtoEstoque) {
+              // Atualiza o estoque persistido e marca para conferir se divergir (logica simplificada aqui, 
+              // pois a validação completa do grupo roda abaixo, o importante é atualizar o estoque)
+              await this.prisma.est_contagem_itens.update({
+                where: { id: itemId },
+                data: { estoque: produtoEstoque.ESTOQUE }
+              });
+              console.log(`[DEBUG] Item ${itemId} revalidado com estoque ${produtoEstoque.ESTOQUE}`);
+            }
+          }
+        } catch (e) {
+          console.error(`[DEBUG] Falha ao revalidar item ${itemId}`, e);
+          // Se falhar de novo, infelizmente vai usar o valor antigo.
+        }
+      }
+    }
+
     // Sempre trava a contagem atual (liberado_contagem = false)
     await this.prisma.est_contagem.updateMany({
       where: {
@@ -667,7 +733,9 @@ export class EstoqueSaidasRepository {
         // Mas para garantir consistência, vamos usar a lógica de soma para tudo.
 
         // 1. Calcular o Estoque de Referência
-        // Como o SQL usa MAX(estoque), todos os itens do mesmo produto devem ter o mesmo valor de estoque total.
+        // Como agora o updateItemConferir ATUALIZA o campo estoque com o valor da OpenQuery no momento do salvo,
+        // podemos confiar no valor do banco, sem precisar fazer fetch de novo aqui.
+        // Isso atende o requisito: "a busca deve ser feita sempre que for clicado em salvar no item no front"
         const estoqueRef = groupItems[0].estoque || 0;
 
         // 2. Calcular a Soma Total Contada para este Produto (somando logs de todos os itens do grupo)
