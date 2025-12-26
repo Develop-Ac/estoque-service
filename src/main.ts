@@ -49,8 +49,10 @@ async function bootstrap() {
   );
 
   const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN);
-  // Ex.: CORS_ORIGIN="http://intranet.acacessorios.local,http://localhost:3000"
-  // ou   CORS_ORIGIN="regex:^https?://(localhost:\d+|.*\.acacessorios\.local)$"
+  // Adicionar frontend local na porta 8081 explicitamente
+  allowedOrigins.push('http://localhost:8081');
+  allowedOrigins.push('http://127.0.0.1:8081');
+  allowedOrigins.push('http://192.168.1.145:8081');
 
   app.enableCors({
     origin: (origin, callback) => {
@@ -103,13 +105,13 @@ async function bootstrap() {
       .setContact('AC Acessórios - TI', 'https://acacessorios.com.br', 'ti@acacessorios.com.br')
       .setLicense('Proprietário', '')
       .addBearerAuth(
-      {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'JWT',
-        description: 'Token JWT para autenticação',
-      },
-      'jwt',
+        {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description: 'Token JWT para autenticação',
+        },
+        'jwt',
       )
       .addServer(process.env.PUBLIC_URL ?? 'http://localhost:8000', 'Servidor de Desenvolvimento')
       .addServer('http://intranetbackend.acacessorios.local', 'Servidor de Produção')
