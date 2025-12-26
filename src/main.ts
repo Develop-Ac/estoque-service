@@ -56,6 +56,8 @@ async function bootstrap() {
   // Adicionar domínios de produção/intranet
   allowedOrigins.push('http://contagem.acacessorios.local');
   allowedOrigins.push('https://contagem.acacessorios.local');
+  allowedOrigins.push('http://intranet.acacessorios.local');
+  allowedOrigins.push('https://intranet.acacessorios.local');
 
   app.enableCors({
     origin: (origin, callback) => {
