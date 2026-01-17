@@ -138,4 +138,13 @@ export class CreateContagemDto {
   produtos!: CreateContagemItemDto[];
 
   piso?: string;
+
+  @ApiProperty({
+    description: 'Tipo de contagem estendida (1=Diária, 2=Avulsa)',
+    example: 1,
+    default: 1
+  })
+  @IsOptional()
+  @IsNumber()
+  tipo?: number;
 }

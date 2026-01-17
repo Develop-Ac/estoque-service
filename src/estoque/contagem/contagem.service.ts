@@ -15,6 +15,7 @@ export class EstoqueSaidasService {
     data_inicial: string;
     data_final: string;
     empresa: string;
+    tipo?: number;
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchSaidas(filters);
   }
@@ -57,8 +58,12 @@ export class EstoqueSaidasService {
     }));
   }
 
-  async getAllContagens(): Promise<ContagemResponseDto[]> {
-    return this.repo.getAllContagens();
+  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string }) {
+    return this.repo.getAllContagens(params);
+  }
+
+  async deleteContagem(id: string) {
+    return this.repo.deleteContagem(id);
   }
 
   async getLogsAgregadosPorContagem(contagemId: string) {

@@ -49,9 +49,9 @@ function formatAndValidateLocation(text: string | null): string | null {
   const upperApp = text.toUpperCase();
 
   // 1. Regras Especiais (Prioridade Alta)
-  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR)
-  // Aceita digitos OU a palavra especifica BEBEDOR (ou pode ser genérico \w+)
-  const boxMatch = upperApp.match(/\bBOX\s*(?:\d+|BEBEDOR)\b/);
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4)
+  // Aceita digitos (com opcional CX N) OU a palavra especifica BEBEDOR
+  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:\s+CX\s+\d+)?)\b/);
   if (boxMatch) {
     return `A-${boxMatch[0]}`;
   }
@@ -99,8 +99,9 @@ export class EstoqueSaidasRepository {
     data_inicial: string; // YYYY-MM-DD
     data_final: string;   // YYYY-MM-DD
     empresa: string;      // '3' por default
+    tipo?: number;        // 1=Diária, 2=Avulsa
   }): Promise<EstoqueSaidaRow[]> {
-    const { data_inicial, data_final, empresa } = params;
+    const { data_inicial, data_final, empresa, tipo } = params;
 
     // Sanitização adicional (já validado no DTO, aqui é um "belt and suspenders"):
     if (!/^\d{4}-\d{2}-\d{2}$/.test(data_inicial) || !/^\d{4}-\d{2}-\d{2}$/.test(data_final)) {
@@ -194,12 +195,13 @@ export class EstoqueSaidasRepository {
       return { ...row, APLICACOES: txtApp, LOCALIZACAO: txtLoc };
     });
 
-    // Duplica os itens conforme solicitado
+    // Duplica os itens conforme solicitado APENAS SE TIPO = 2 (AVULSA)
     const result: EstoqueSaidaRow[] = [];
     for (const item of sanitizedRows) {
       result.push(item);
-      // Só cria o segundo item se APLICACOES for válido (não nulo)
-      if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
+
+      // Só cria o segundo item se APLICACOES for válido (não nulo) E se for Tipo 2 (Avulsa)
+      if (tipo === 2 && item.APLICACOES != null && item.APLICACOES.trim() !== '') {
         // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
         result.push({
           ...item,
@@ -299,6 +301,7 @@ export class EstoqueSaidasRepository {
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
           piso: String(piso),
+          tipo: createContagemDto.tipo || 1, // Salva o tipo (1=Diária, 2=Avulsa)
         },
         include: {
           usuario: {
@@ -957,9 +960,40 @@ export class EstoqueSaidasRepository {
     return logs;
   }
 
-  async getAllContagens() {
-    // Buscar todas as contagens com informações do usuário e logs
+  async getAllContagens(params: {
+    page?: number;
+    pageSize?: number;
+    data?: string;
+    piso?: string;
+  } = {}) {
+    const { page = 1, pageSize = 20, data, piso } = params;
+    const skip = (page - 1) * pageSize;
+
+    // Construir os filtros dinamicamente
+    const whereClause: Prisma.est_contagemWhereInput = {
+      status: 0 // Apenas ativos
+    };
+
+    if (piso) {
+      whereClause.piso = piso;
+    }
+
+    if (data) {
+      // Filtrar contagens que tenham itens na data específica
+      // A tabela est_contagem_itens tem a data.
+      // query: Buscar contagens onde EXISTS pelo menos um item com a data.
+      whereClause.contagem_cuid = {
+        in: await this.findContagemCuidsByDate(data)
+      };
+    }
+
+    // Buscar total para paginação
+    const total = await this.prisma.est_contagem.count({ where: whereClause });
+    const last_page = Math.ceil(total / pageSize);
+
+    // Buscar contagens paginadas
     const contagens = await this.prisma.est_contagem.findMany({
+      where: whereClause,
       include: {
         usuario: {
           select: {
@@ -991,10 +1025,134 @@ export class EstoqueSaidasRepository {
       },
       orderBy: {
         created_at: 'desc'
-      }
+      },
+      skip: skip,
+      take: pageSize
     });
 
-    return contagens;
+    // Precisamos buscar os ITENS para exibir a data correta no frontend
+    // O frontend quer exibir a data do item, não a de criação.
+    // Vamos buscar o primeiro item de cada contagem para pegar a data.
+    const contagensComItens = await Promise.all(contagens.map(async (c) => {
+      // Otimização: buscar apenas 1 item para pegar a data
+      const primeiroItem = await this.prisma.est_contagem_itens.findFirst({
+        where: { contagem_cuid: c.contagem_cuid ?? '' },
+        select: { data: true }
+      });
+
+      // Validar se o GRUPO (CUID) já foi iniciado (tem logs em QUALQUER contagem do grupo)
+      // para controlar a exibição do botão de exclusão no front.
+      let grupoIniciado = false;
+      if (c.contagem_cuid) {
+        const checkLogs = await this.prisma.est_contagem_log.findFirst({
+          where: {
+            contagem: {
+              contagem_cuid: c.contagem_cuid
+            }
+          },
+          select: { id: true }
+        });
+        grupoIniciado = !!checkLogs;
+      }
+
+      return {
+        ...c,
+        grupo_iniciado: grupoIniciado, // Nova propriedade
+        itens: primeiroItem ? [{ data: primeiroItem.data }] : [] // Mock items array with just date
+      };
+    }));
+
+    return {
+      data: contagensComItens,
+      total,
+      page,
+      last_page
+    };
+  }
+
+  // Helper para buscar CUIDs por data de item
+  private async findContagemCuidsByDate(dateStr: string): Promise<string[]> {
+    // dateStr deve ser YYYY-MM-DD
+    // O banco salva DateTime, mas items salvam a data "truncada" ou especifica?
+    // No createContagem: data: produto.DATA (yyyy-mm-dd)
+    // Prisma armazena DateTime. Precisamos comparar intervalo ou truncado.
+    // Assumindo que est_contagem_itens.data armazena meia-noite do dia.
+
+    // Ajuste para garantir comparação correta com timestamp
+    const startDate = new Date(dateStr);
+    startDate.setUTCHours(0, 0, 0, 0);
+    const endDate = new Date(dateStr);
+    endDate.setUTCHours(23, 59, 59, 999);
+
+    const items = await this.prisma.est_contagem_itens.findMany({
+      where: {
+        data: {
+          gte: startDate,
+          lte: endDate
+        }
+      },
+      select: { contagem_cuid: true },
+      distinct: ['contagem_cuid']
+    });
+
+    return items.map(i => i.contagem_cuid);
+  }
+
+  async deleteContagem(id: string) {
+    // 1. Verificar se a contagem alvo existe
+    const contagemAlvo = await this.prisma.est_contagem.findUnique({
+      where: { id },
+      include: { logs: true }
+    });
+
+    if (!contagemAlvo) {
+      throw new BadRequestException('Contagem não encontrada');
+    }
+
+    // 2. Lógica de Exclusão em Grupo (Smart Delete com Trava de Integridade)
+    if (contagemAlvo.contagem_cuid) {
+      // Buscar TODAS as contagens ativas do grupo
+      const grupoContagens = await this.prisma.est_contagem.findMany({
+        where: {
+          contagem_cuid: contagemAlvo.contagem_cuid,
+          status: 0
+        },
+        include: { logs: true }
+      });
+
+      // TRAVA: Verificar se ALGUMA contagem do grupo já foi iniciada (tem logs)
+      const algumIniciado = grupoContagens.some(c => c.logs.length > 0);
+
+      if (algumIniciado) {
+        // Se qualquer uma do grupo (1, 2 ou 3) tiver logs, BLOQUEIA A EXCLUSÃO DE TODAS.
+        // Motivo: "As contagens sempre são conjunto de 3". Não podemos quebrar o conjunto.
+        // O usuário solicitou explicitamente essa trava: se iniciado, permite apenas edição, não exclusão.
+        throw new BadRequestException('Não é possível excluir. O grupo de contagens já foi iniciado.');
+      }
+
+      // Se NENHUMA foi iniciada, exclui TODAS (status = 1)
+      const idsParaExcluir = grupoContagens.map(c => c.id);
+
+      if (idsParaExcluir.length > 0) {
+        return await this.prisma.est_contagem.updateMany({
+          where: { id: { in: idsParaExcluir } },
+          data: { status: 1 }
+        });
+      }
+
+    } else {
+      // Fallback: Sem CUID (isolada), verifica apenas ela mesma
+      if (contagemAlvo.logs.length > 0) {
+        throw new BadRequestException('Não é possível excluir uma contagem já iniciada (possui registros).');
+      }
+
+      return await this.prisma.est_contagem.update({
+        where: { id },
+        data: { status: 1 }
+      });
+    }
+
+    return { count: 0, message: "Nenhuma contagem excluída" };
   }
 
   async createLog(createLogData: {

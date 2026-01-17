@@ -52,6 +52,7 @@ async function bootstrap() {
   // Adicionar frontend local na porta 8081 explicitamente
   allowedOrigins.push('http://localhost:8081');
   allowedOrigins.push('http://localhost:8000');
+  allowedOrigins.push('http://localhost:3000');
   allowedOrigins.push('http://127.0.0.1:8081');
   allowedOrigins.push('http://192.168.1.145:8081');
   // Adicionar domínios de produção/intranet

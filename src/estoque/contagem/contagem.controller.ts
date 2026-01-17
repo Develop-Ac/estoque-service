@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, Param, Put, BadRequestException } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Param, Put, Delete, BadRequestException } from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
@@ -92,8 +92,8 @@ export class EstoqueSaidasController {
     }
   })
   async getSaidas(@Query() q: GetSaidasQueryDto): Promise<EstoqueSaidaRow[]> {
-    const { data_inicial, data_final, empresa = '3' } = q;
-    return this.service.listarSaidas({ data_inicial, data_final, empresa });
+    const { data_inicial, data_final, empresa = '3', tipo } = q;
+    return this.service.listarSaidas({ data_inicial, data_final, empresa, tipo });
   }
 
   @Get('lista')
@@ -169,8 +169,28 @@ export class EstoqueSaidasController {
       message: 'Erro interno do servidor'
     }
   })
-  async getAllContagens(): Promise<ContagemResponseDto[]> {
-    return this.service.getAllContagens();
+  async getAllContagens(
+    @Query('page') page?: number,
+    @Query('pageSize') pageSize?: number,
+    @Query('data') data?: string,
+    @Query('piso') piso?: string,
+  ): Promise<any> { // Changed return type to any for now to support pagination object
+    return this.service.getAllContagens({
+      page: page ? Number(page) : 1,
+      pageSize: pageSize ? Number(pageSize) : 20,
+      data,
+      piso
+    });
+  }
+
+  @ApiTags('Estoque')
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Excluir (Inativar) uma contagem',
+    description: 'Inativa uma contagem se ela não tiver sido iniciada.'
+  })
+  async deleteContagem(@Param('id') id: string) {
+    return this.service.deleteContagem(id);
   }
 
   @Get(':id_usuario')

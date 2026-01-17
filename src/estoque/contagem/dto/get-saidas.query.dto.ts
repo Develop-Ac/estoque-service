@@ -1,5 +1,5 @@
 import { Transform } from 'class-transformer';
-import { IsOptional, IsString, Matches } from 'class-validator';
+import { IsOptional, IsString, Matches, IsNumber } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 const DATE_RX = /^\d{4}-\d{2}-\d{2}$/; // YYYY-MM-DD
@@ -35,4 +35,13 @@ export class GetSaidasQueryDto {
   @Transform(({ value }) => (value === undefined ? '3' : String(value)))
   @Matches(/^\d+$/, { message: 'empresa deve conter apenas dígitos' })
   empresa?: string = '3';
+  @ApiProperty({
+    description: 'Tipo de contagem (1=Diária, 2=Avulsa)',
+    example: 1,
+    required: false
+  })
+  @IsOptional()
+  @Transform(({ value }) => (value ? Number(value) : 1))
+  @IsNumber()
+  tipo?: number = 1;
 }
