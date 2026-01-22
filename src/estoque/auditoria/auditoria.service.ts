@@ -81,7 +81,14 @@ export class AuditoriaService {
         const result: any[] = [];
 
         // Buscar um usuário do sistema para auto-auditoria uma única vez
-        const systemUser = await this.prisma.sis_usuarios.findFirst();
+        // Buscar um usuário do sistema para auto-auditoria
+        let systemUser = await this.prisma.sis_usuarios.findFirst({
+            where: { nome: 'SISTEMA' }
+        });
+
+        if (!systemUser) {
+            systemUser = await this.prisma.sis_usuarios.findFirst();
+        }
 
         for (const codProdutoStr in itemsByProduct) {
             const cod_produto = Number(codProdutoStr);
@@ -116,7 +123,8 @@ export class AuditoriaService {
                     cod_produto: cod_produto,
                     contagem_cuid: { in: cuidsEnvolvidos },
                     status: 1
-                }
+                },
+                orderBy: { created_at: 'desc' }
             });
 
             // Montar Histórico Consolidado
@@ -203,8 +211,35 @@ export class AuditoriaService {
                 history,
                 diferencas,
                 ja_auditado: !!audetado,
-                audit_id: audetado?.id
+                audit_id: audetado?.id,
+                audit_dados: audetado ? {
+                    tipo: audetado.tipo_movimento,
+                    qtd: audetado.quantidade_movimento,
+                    obs: audetado.observacao
+                } : null
             });
+        }
+
+        // 4. Verificação de Recorrência de Erro (Pós-processamento ou dentro do loop anterior se otimizado)
+        // Como o loop acima já é pesado, vamos fazer uma query extra leve para cada item ou buscar em lote se possível.
+        // Vamos iterar o result para preencher a flag 'recorrencia_erro'.
+        for (const item of result) {
+            const ultimasAuditorias = await this.prisma.est_auditoria.findMany({
+                where: {
+                    cod_produto: item.cod_produto,
+                    status: 1
+                },
+                orderBy: { created_at: 'desc' },
+                take: 3,
+                select: { tipo_movimento: true }
+            });
+
+            // Se tiver qualquer apontamento de BAIXA ou INCLUSAO nas ultimas 3
+            const temErroRecorrente = ultimasAuditorias.some(a =>
+                a.tipo_movimento === 'BAIXA' || a.tipo_movimento === 'INCLUSAO'
+            );
+
+            (item as any).recorrencia_erro = temErroRecorrente;
         }
 
         return result;
