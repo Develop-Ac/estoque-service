@@ -200,8 +200,8 @@ export class EstoqueSaidasRepository {
     for (const item of sanitizedRows) {
       result.push(item);
 
-      // Só cria o segundo item se APLICACOES for válido (não nulo) E se for Tipo 2 (Avulsa)
-      if (tipo === 2 && item.APLICACOES != null && item.APLICACOES.trim() !== '') {
+      // Só cria o segundo item se APLICACOES for válido (não nulo)
+      if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
         // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
         result.push({
           ...item,
