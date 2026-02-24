@@ -20,7 +20,26 @@ export class EstoqueSaidasService {
   }
 
   async createContagem(createContagemDto: CreateContagemDto): Promise<ContagemResponseDto> {
-    return this.repo.createContagem(createContagemDto);
+    try {
+      const result = await this.repo.createContagem(createContagemDto);
+
+      await fetch('http://log-service.acacessorios.local/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          usuario: createContagemDto.usuario,
+          setor: 'Compras',
+          tela: 'Comparativo',
+          acao: 'Create',
+          descricao: `Criou contagem do colaborador ${createContagemDto.colaborador} com ${createContagemDto.produtos.length} produtos.`,
+        }),
+      });
+
+      return result;
+    } catch (error) {
+      console.error('Error creating contagem:', error);
+      throw error;
+    }
   }
 
   async getContagensByUsuario(idUsuario: string): Promise<ContagemResponseDto[]> {

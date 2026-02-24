@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsArray, IsDateString, IsNotEmpty, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { IsArray, IsDateString, IsNotEmpty, IsNumber, IsOptional, isString, IsString, ValidateNested } from 'class-validator';
 
 export class CreateContagemItemDto {
   @ApiProperty({
@@ -138,4 +138,7 @@ export class CreateContagemDto {
   produtos!: CreateContagemItemDto[];
 
   piso?: string;
+
+  @IsString()
+  usuario: string
 }
