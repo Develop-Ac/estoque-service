@@ -1,9 +1,9 @@
-import { Body, Controller, Get, Post, Query, Param, Put, BadRequestException } from '@nestjs/common';
-import { 
-  ApiTags, 
-  ApiOperation, 
-  ApiQuery, 
-  ApiOkResponse, 
+import { Body, Controller, Get, Post, Query, Param, Put, Delete, BadRequestException } from '@nestjs/common';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiQuery,
+  ApiOkResponse,
   ApiBadRequestResponse,
   ApiInternalServerErrorResponse,
   ApiExtraModels,
@@ -26,7 +26,7 @@ import { LogResponseDto } from './dto/log-response.dto';
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
 @Controller('contagem')
 export class EstoqueSaidasController {
-  constructor(private readonly service: EstoqueSaidasService) {}
+  constructor(private readonly service: EstoqueSaidasService) { }
 
   @Get()
   @ApiOperation({
@@ -92,8 +92,8 @@ export class EstoqueSaidasController {
     }
   })
   async getSaidas(@Query() q: GetSaidasQueryDto): Promise<EstoqueSaidaRow[]> {
-    const { data_inicial, data_final, empresa = '3' } = q;
-    return this.service.listarSaidas({ data_inicial, data_final, empresa });
+    const { data_inicial, data_final, empresa = '3', tipo } = q;
+    return this.service.listarSaidas({ data_inicial, data_final, empresa, tipo });
   }
 
   @Get('lista')
@@ -169,8 +169,28 @@ export class EstoqueSaidasController {
       message: 'Erro interno do servidor'
     }
   })
-  async getAllContagens(): Promise<ContagemResponseDto[]> {
-    return this.service.getAllContagens();
+  async getAllContagens(
+    @Query('page') page?: number,
+    @Query('pageSize') pageSize?: number,
+    @Query('data') data?: string,
+    @Query('piso') piso?: string,
+  ): Promise<any> { // Changed return type to any for now to support pagination object
+    return this.service.getAllContagens({
+      page: page ? Number(page) : 1,
+      pageSize: pageSize ? Number(pageSize) : 20,
+      data,
+      piso
+    });
+  }
+
+  @ApiTags('Estoque')
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Excluir (Inativar) uma contagem',
+    description: 'Inativa uma contagem se ela não tiver sido iniciada.'
+  })
+  async deleteContagem(@Param('id') id: string) {
+    return this.service.deleteContagem(id);
   }
 
   @Get(':id_usuario')
@@ -265,14 +285,14 @@ export class EstoqueSaidasController {
         liberado_contagem: true
       },
       {
-        id: 'clx1234567890type2', 
+        id: 'clx1234567890type2',
         contagem: 2,
         contagem_cuid: 'clx1234567890group',
         liberado_contagem: false
       },
       {
         id: 'clx1234567890type3',
-        contagem: 3, 
+        contagem: 3,
         contagem_cuid: 'clx1234567890group',
         liberado_contagem: false
       }
@@ -348,7 +368,7 @@ export class EstoqueSaidasController {
     }
   })
   async updateLiberadoContagem(@Body() body: UpdateLiberadoContagemDto) {
-    return this.service.updateLiberadoContagem(body.contagem_cuid, body.contagem, !!body.divergencia);
+    return this.service.updateLiberadoContagem(body.contagem_cuid, Number(body.contagem), !!body.divergencia, body.itensParaRevalidar);
   }
 
   @Put('item/:id')
@@ -430,7 +450,7 @@ export class EstoqueSaidasController {
     }
   })
   async getEstoqueProduto(
-    @Param('cod_produto') codProduto: string, 
+    @Param('cod_produto') codProduto: string,
     @Query('empresa') empresa?: string
   ): Promise<ConferirEstoqueResponseDto | null> {
     const codProdutoNum = parseInt(codProduto, 10);
@@ -438,6 +458,23 @@ export class EstoqueSaidasController {
       throw new BadRequestException('Código do produto deve ser um número válido');
     }
     return this.service.getEstoqueProduto(codProdutoNum, empresa);
+  }
+
+  @Get('logs-agregados/:id')
+  @ApiOperation({
+    summary: 'Buscar logs agregados de uma contagem',
+    description: 'Retorna TODOS os logs associados aos itens desta contagem, cruzando pelo identificador_item. Isso permite ver dados de contagens irmãs (mesmo produto, usuários diferentes) mesmo que tenham CUIDs diferentes.'
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'ID da contagem',
+    type: 'string'
+  })
+  @ApiOkResponse({
+    description: 'Logs agregados retornados com sucesso'
+  })
+  async getLogsAgregados(@Param('id') id: string) {
+    return this.service.getLogsAgregadosPorContagem(id);
   }
 
   @Post('log')
@@ -475,5 +512,26 @@ export class EstoqueSaidasController {
   })
   async createLog(@Body() createLogDto: CreateLogDto): Promise<LogResponseDto> {
     return await this.service.createLog(createLogDto);
+  }
+
+  @Get('logs/:contagem_id')
+  @ApiOperation({
+    summary: 'Listar logs de uma contagem',
+    description: 'Retorna todos os logs de contagem para um ID de contagem específico, incluindo detalhes do item (localização) e usuário.'
+  })
+  @ApiParam({
+    name: 'contagem_id',
+    description: 'ID da contagem',
+    example: 'clx1234567890abcdef',
+    type: 'string'
+  })
+  @ApiOkResponse({
+    description: 'Lista de logs retornada com sucesso',
+    type: LogResponseDto,
+    isArray: true
+  })
+  async getLogsByContagem(@Param('contagem_id') contagemId: string) {
+    const logs = await this.service.getLogsByContagem(contagemId);
+    return { logs }; // Wrap in object to match frontend expectation { logs: [] }
   }
 }

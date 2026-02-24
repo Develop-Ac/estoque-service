@@ -1,0 +1,58 @@
+  async getLogsAgregadosPorContagem(contagemId: string) {
+    // 1. Buscar os itens da contagem para extrair os identificadores
+    const contagem = await this.prisma.est_contagem.findUnique({
+      where: { id: contagemId },
+      include: {
+        itens: {
+          select: {
+            identificador_item: true
+          }
+        }
+      }
+    });
+
+    if (!contagem || !contagem.itens.length) {
+      return [];
+    }
+
+    // Extrair identificadores únicos
+    const identificadores = [...new Set(contagem.itens.map(i => i.identificador_item).filter(Boolean))];
+
+    if (identificadores.length === 0) {
+      return [];
+    }
+
+    // 2. Buscar TODOS os logs que referenciam esses identificadores
+    //    Isso traz logs dessa contagem E de outras contagens (irmãs)
+    const logs = await this.prisma.est_contagem_log.findMany({
+      where: {
+        identificador_item: {
+          in: identificadores
+        }
+      },
+      include: {
+        item: {
+          select: {
+            cod_produto: true,
+            desc_produto: true,
+            localizacao: true
+          }
+        },
+        usuario: {
+          select: {
+            nome: true
+          }
+        },
+        contagem: {
+           select: {
+             contagem: true // Importante para saber se é Round 1, 2 ou 3
+           }
+        }
+      },
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
+
+    return logs;
+  }

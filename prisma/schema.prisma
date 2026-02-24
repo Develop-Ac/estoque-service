@@ -16,6 +16,7 @@ model sis_usuarios {
   setor             String
   est_contagem      est_contagem[]
   est_contagem_logs est_contagem_log[]
+  est_auditoria     est_auditoria[]
   sis_permissoes    sis_permissoes[]
 }
 
@@ -36,6 +37,7 @@ model com_cotacao_itens {
   unidade          String?
   quantidade       Int
   dt_ultima_compra DateTime?
+  qtd_sugerida     Int?
   com_cotacao      com_cotacao @relation(fields: [pedido_cotacao], references: [pedido_cotacao], onDelete: Cascade)
 
   @@id([pedido_cotacao, pro_codigo])
@@ -119,6 +121,7 @@ model com_cotacao_itens_for {
   unidade        String?
   quantidade     Int
   valor_unitario Float?
+  qtd_sugerida   Int?            @default(0)
   cotacao        com_cotacao_for @relation(fields: [pedido_cotacao, for_codigo], references: [pedido_cotacao, for_codigo], onDelete: Cascade)
 
   @@index([pedido_cotacao, for_codigo])
@@ -153,6 +156,8 @@ model com_pedido_itens {
   for_codigo     Int
   quantidade     Decimal
   created_at     DateTime   @default(now())
+  renato         Boolean?   @default(false)
+  carlos         Boolean?   @default(false)
   pedido         com_pedido @relation(fields: [pedido_id], references: [id], onDelete: Cascade)
 
   @@unique([pedido_id, pro_codigo, for_codigo])
@@ -167,6 +172,8 @@ model est_contagem {
   liberado_contagem Boolean            @default(false)
   contagem_cuid     String?
   piso              String?            @db.VarChar
+  status            Int                @default(0)
+  tipo              Int                @default(1) // 1=Diária, 2=Avulsa
   usuario           sis_usuarios       @relation(fields: [colaborador], references: [id])
   logs              est_contagem_log[]
 
@@ -429,4 +436,155 @@ model sis_permissoes {
   criar        Boolean      @default(false)
   deletar      Boolean      @default(false)
   sis_usuarios sis_usuarios @relation(fields: [usuario_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_usuario")
+}
+
+model com_fifo_completo {
+  id                         Int       @id @default(autoincrement())
+  data_processamento         DateTime? @default(now()) @db.Timestamp(6)
+  pro_codigo                 String?   @db.VarChar(50)
+  tempo_medio_estoque        Decimal?  @db.Decimal(15, 4)
+  qtd_vendida                Decimal?  @db.Decimal(15, 4)
+  valor_vendido              Decimal?  @db.Decimal(15, 4)
+  data_min_venda             DateTime? @db.Date
+  data_max_venda             DateTime? @db.Date
+  periodo_dias               Int?
+  demanda_media_dia          Decimal?  @db.Decimal(15, 6)
+  num_vendas                 Int?
+  vendas_ult_12m             Decimal?  @db.Decimal(15, 4)
+  vendas_12m_ant             Decimal?  @db.Decimal(15, 4)
+  fator_tendencia            Decimal?  @db.Decimal(10, 6)
+  tendencia_label            String?   @db.VarChar(20)
+  dias_ruptura               Int?
+  demanda_media_dia_ajustada Decimal?  @db.Decimal(15, 6)
+  pro_descricao              String?
+  estoque_disponivel         Decimal?  @db.Decimal(15, 4)
+  mar_descricao              String?   @db.VarChar(100)
+  fornecedor1                String?   @db.VarChar(200)
+  fornecedor2                String?   @db.VarChar(200)
+  fornecedor3                String?   @db.VarChar(200)
+  pct_acum_valor             Decimal?  @db.Decimal(10, 4)
+  curva_abc                  String?   @db.VarChar(10)
+  categoria_estocagem        String?   @db.VarChar(20)
+  estoque_min_base           Int?
+  estoque_max_base           Int?
+  fator_ajuste_tendencia     Decimal?  @db.Decimal(10, 6)
+  estoque_min_ajustado       Int?
+  estoque_max_ajustado       Int?
+  estoque_min_sugerido       Int?
+  estoque_max_sugerido       Int?
+  tipo_planejamento          String?   @db.VarChar(30)
+  alerta_tendencia_alta      String?   @db.VarChar(10)
+  descricao_calculo_estoque  String?
+  created_at                 DateTime? @default(now()) @db.Timestamp(6)
+  sgr_codigo                 Int?
+  teve_alteracao_analise     Boolean?  @default(false)
+  dados_alteracao_json       String?
+
+  @@index([teve_alteracao_analise], map: "idx_com_fifo_alteracao")
+  @@index([categoria_estocagem], map: "idx_com_fifo_categoria_estocagem")
+  @@index([curva_abc], map: "idx_com_fifo_curva_abc")
+  @@index([data_processamento], map: "idx_com_fifo_data_processamento")
+  @@index([pro_codigo], map: "idx_com_fifo_pro_codigo")
+}
+
+model com_nfe_conciliacao {
+  chave_nfe          String   @id
+  emitente           String
+  cnpj_emitente      String?
+  data_emissao       DateTime
+  valor_total        Float
+  xml_completo       String?
+  status_analise     String   @default("Tributado - Verificado")
+  valor_guia         Float    @default(0.0)
+  status_erp         String   @default("PENDENTE")
+  updated_at         DateTime
+  created_at         DateTime @default(now())
+  tipo_operacao      Int      @default(0)
+  tipo_operacao_desc String   @default("ENTRADA PRÓPRIA")
+}
+
+model com_pagamento_guia {
+  chave_nfe      String   @id
+  data_pagamento DateTime @default(now())
+  valor          Float    @default(0.0)
+  observacoes    String   @default("")
+}
+
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model eco_produtos_carros {
+  pro_codigo    String? @db.VarChar(50)
+  pro_descricao String? @db.VarChar(500)
+  referencia    String? @db.VarChar(100)
+  carro_1       String? @db.VarChar(150)
+  ano_1         String? @db.VarChar(100)
+  carro_2       String? @db.VarChar(150)
+  ano_2         String? @db.VarChar(100)
+  carro_3       String? @db.VarChar(150)
+  ano_3         String? @db.VarChar(100)
+  carro_4       String? @db.VarChar(150)
+  ano_4         String? @db.VarChar(100)
+  carro_5       String? @db.VarChar(150)
+  ano_5         String? @db.VarChar(100)
+  carro_6       String? @db.VarChar(150)
+  ano_6         String? @db.VarChar(100)
+  carro_7       String? @db.VarChar(150)
+  ano_7         String? @db.VarChar(100)
+  carro_8       String? @db.VarChar(150)
+  ano_8         String? @db.VarChar(100)
+  carro_9       String? @db.VarChar(150)
+  ano_9         String? @db.VarChar(100)
+  carro_10      String? @db.VarChar(150)
+  ano_10        String? @db.VarChar(100)
+
+  @@ignore
+}
+
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model eco_produtos_carros_erro {
+  pro_codigo    String? @db.VarChar(50)
+  pro_descricao String? @db.VarChar(500)
+  referencia    String? @db.VarChar(100)
+  carro_1       String? @db.VarChar(150)
+  ano_1         String? @db.VarChar(100)
+  carro_2       String? @db.VarChar(150)
+  ano_2         String? @db.VarChar(100)
+  carro_3       String? @db.VarChar(150)
+  ano_3         String? @db.VarChar(100)
+  carro_4       String? @db.VarChar(150)
+  ano_4         String? @db.VarChar(100)
+  carro_5       String? @db.VarChar(150)
+  ano_5         String? @db.VarChar(100)
+  carro_6       String? @db.VarChar(150)
+  ano_6         String? @db.VarChar(100)
+  carro_7       String? @db.VarChar(150)
+  ano_7         String? @db.VarChar(100)
+  carro_8       String? @db.VarChar(150)
+  ano_8         String? @db.VarChar(100)
+  carro_9       String? @db.VarChar(150)
+  ano_9         String? @db.VarChar(100)
+  carro_10      String? @db.VarChar(150)
+  ano_10        String? @db.VarChar(100)
+
+  @@ignore
+}
+
+model est_auditoria {
+  id                 String   @id @default(cuid())
+  contagem_cuid      String
+  data_auditoria     DateTime @default(now())
+  cod_produto        Int
+  diferenca_apontada Int
+  tipo_movimento     String?  @db.VarChar(20) // 'BAIXA', 'INCLUSAO', 'CORRETO'
+  quantidade_movimento Int?
+  status             Int      @default(0) // 0=Pendente, 1=Auditado
+  observacao         String?
+  usuario_id         String
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  usuario sis_usuarios @relation(fields: [usuario_id], references: [id])
+
+  @@index([contagem_cuid])
+  @@index([cod_produto])
+  @@index([status])
 }

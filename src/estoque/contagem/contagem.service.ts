@@ -9,12 +9,13 @@ import { LogResponseDto } from './dto/log-response.dto';
 
 @Injectable()
 export class EstoqueSaidasService {
-  constructor(private readonly repo: EstoqueSaidasRepository) {}
+  constructor(private readonly repo: EstoqueSaidasRepository) { }
 
   async listarSaidas(filters: {
     data_inicial: string;
     data_final: string;
     empresa: string;
+    tipo?: number;
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchSaidas(filters);
   }
@@ -61,8 +62,8 @@ export class EstoqueSaidasService {
     return this.repo.getEstoqueProduto(codProduto, empresa);
   }
 
-  async updateLiberadoContagem(contagem_cuid: string, contagem: number, divergencia: boolean) {
-    return this.repo.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+  async updateLiberadoContagem(contagem_cuid: string, contagem: number, divergencia: boolean, itensParaRevalidar?: string[]) {
+    return this.repo.updateLiberadoContagem(contagem_cuid, contagem, divergencia, itensParaRevalidar);
   }
 
   async getContagensByGrupo(contagem_cuid: string): Promise<ContagemResponseDto[]> {
@@ -76,11 +77,23 @@ export class EstoqueSaidasService {
     }));
   }
 
-  async getAllContagens(): Promise<ContagemResponseDto[]> {
-    return this.repo.getAllContagens();
+  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string }) {
+    return this.repo.getAllContagens(params);
+  }
+
+  async deleteContagem(id: string) {
+    return this.repo.deleteContagem(id);
+  }
+
+  async getLogsAgregadosPorContagem(contagemId: string) {
+    return this.repo.getLogsAgregadosPorContagem(contagemId);
   }
 
   async createLog(createLogDto: CreateLogDto): Promise<LogResponseDto> {
     return this.repo.createLog(createLogDto);
+  }
+
+  async getLogsByContagem(contagemId: string) {
+    return this.repo.getLogsByContagem(contagemId);
   }
 }
