@@ -301,7 +301,7 @@ export class EstoqueSaidasRepository {
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
           piso: String(piso),
-          tipo: createContagemDto.tipo || 1, // Salva o tipo (1=Diária, 2=Avulsa)
+          // tipo: createContagemDto.contagem || 1, // Salva o tipo (1=Diária, 2=Avulsa)
         },
         include: {
           usuario: {
@@ -971,7 +971,7 @@ export class EstoqueSaidasRepository {
 
     // Construir os filtros dinamicamente
     const whereClause: Prisma.est_contagemWhereInput = {
-      status: 0 // Apenas ativos
+      // status: 0 // Apenas ativos
     };
 
     if (piso) {
@@ -1115,13 +1115,13 @@ export class EstoqueSaidasRepository {
       const grupoContagens = await this.prisma.est_contagem.findMany({
         where: {
           contagem_cuid: contagemAlvo.contagem_cuid,
-          status: 0
+          // status: 0
         },
         include: { logs: true }
       });
 
       // TRAVA: Verificar se ALGUMA contagem do grupo já foi iniciada (tem logs)
-      const algumIniciado = grupoContagens.some(c => c.logs.length > 0);
+      const algumIniciado = grupoContagens.some(c => Array.isArray(c.logs) && c.logs.length > 0);
 
       if (algumIniciado) {
         // Se qualquer uma do grupo (1, 2 ou 3) tiver logs, BLOQUEIA A EXCLUSÃO DE TODAS.
@@ -1136,7 +1136,8 @@ export class EstoqueSaidasRepository {
       if (idsParaExcluir.length > 0) {
         return await this.prisma.est_contagem.updateMany({
           where: { id: { in: idsParaExcluir } },
-          data: { status: 1 }
+          // data: { status: 1 }
+          data: { liberado_contagem: false } // Or another valid property if you want to mark as deleted
         });
       }
 
@@ -1148,7 +1149,7 @@ export class EstoqueSaidasRepository {
 
       return await this.prisma.est_contagem.update({
         where: { id },
-        data: { status: 1 }
+        data: { liberado_contagem: false } // Or another valid property if you want to mark as deleted
       });
     }
 
