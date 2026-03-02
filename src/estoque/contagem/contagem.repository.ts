@@ -971,7 +971,7 @@ export class EstoqueSaidasRepository {
 
     // Construir os filtros dinamicamente
     const whereClause: Prisma.est_contagemWhereInput = {
-      // status: 0 // Apenas ativos
+      status: 0 // Apenas ativos
     };
 
     if (piso) {
