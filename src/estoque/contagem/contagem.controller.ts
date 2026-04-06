@@ -21,6 +21,7 @@ import { ConferirEstoqueResponseDto } from './dto/conferir-estoque-response.dto'
 import { UpdateLiberadoContagemDto } from './dto/update-liberado-contagem.dto';
 import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
+import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
 
 @ApiTags('Estoque')
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
@@ -308,6 +309,24 @@ export class EstoqueSaidasController {
   })
   async getContagensByGrupo(@Param('contagem_cuid') contagemCuid: string): Promise<ContagemResponseDto[]> {
     return this.service.getContagensByGrupo(contagemCuid);
+  }
+
+  @Put('grupo/:contagem_cuid')
+  @ApiOperation({
+    summary: 'Atualizar piso e equipe de um grupo de contagens',
+    description: 'Atualiza os dados do grupo inteiro (contagens 1, 2 e 3) quando o grupo ainda nao foi iniciado.'
+  })
+  @ApiParam({
+    name: 'contagem_cuid',
+    description: 'Identificador unico do grupo de contagens',
+    example: 'clx1234567890group',
+    type: 'string'
+  })
+  async updateContagemGrupo(
+    @Param('contagem_cuid') contagemCuid: string,
+    @Body() body: UpdateGrupoContagemDto,
+  ) {
+    return this.service.updateContagemGrupo(contagemCuid, body);
   }
 
   @Post()

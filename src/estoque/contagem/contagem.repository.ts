@@ -1136,8 +1136,10 @@ export class EstoqueSaidasRepository {
       if (idsParaExcluir.length > 0) {
         return await this.prisma.est_contagem.updateMany({
           where: { id: { in: idsParaExcluir } },
-          // data: { status: 1 }
-          data: { liberado_contagem: false } // Or another valid property if you want to mark as deleted
+          data: {
+            liberado_contagem: false,
+            status: 1,
+          }
         });
       }
 
@@ -1149,11 +1151,76 @@ export class EstoqueSaidasRepository {
 
       return await this.prisma.est_contagem.update({
         where: { id },
-        data: { liberado_contagem: false } // Or another valid property if you want to mark as deleted
+        data: {
+          liberado_contagem: false,
+          status: 1,
+        }
       });
     }
 
     return { count: 0, message: "Nenhuma contagem excluída" };
+  }
+
+  async updateContagemGrupo(
+    contagemCuid: string,
+    data: {
+      piso?: string;
+      contagem1UsuarioId?: string;
+      contagem2UsuarioId?: string;
+      contagem3UsuarioId?: string;
+    }
+  ) {
+    const grupoContagens = await this.prisma.est_contagem.findMany({
+      where: {
+        contagem_cuid: contagemCuid,
+        status: 0,
+      },
+      include: { logs: { select: { id: true } } },
+    });
+
+    if (grupoContagens.length === 0) {
+      throw new BadRequestException('Grupo de contagem nao encontrado');
+    }
+
+    const grupoIniciado = grupoContagens.some(
+      (c) => Array.isArray(c.logs) && c.logs.length > 0,
+    );
+
+    if (grupoIniciado) {
+      throw new BadRequestException('Nao e possivel alterar. O grupo de contagens ja foi iniciado.');
+    }
+
+    const colaboradorPorContagem: Record<number, string | undefined> = {
+      1: data.contagem1UsuarioId,
+      2: data.contagem2UsuarioId,
+      3: data.contagem3UsuarioId,
+    };
+
+    const updates = grupoContagens.map((contagem) => {
+      const novoColaborador = colaboradorPorContagem[contagem.contagem];
+      return this.prisma.est_contagem.update({
+        where: { id: contagem.id },
+        data: {
+          ...(typeof data.piso !== 'undefined' ? { piso: data.piso } : {}),
+          ...(typeof novoColaborador !== 'undefined' ? { colaborador: novoColaborador } : {}),
+        },
+      });
+    });
+
+    await this.prisma.$transaction(updates);
+
+    return this.prisma.est_contagem.findMany({
+      where: {
+        contagem_cuid: contagemCuid,
+        status: 0,
+      },
+      include: {
+        usuario: {
+          select: { id: true, nome: true, codigo: true },
+        },
+      },
+      orderBy: { contagem: 'asc' },
+    });
   }
 
   async createLog(createLogData: {

@@ -6,6 +6,7 @@ import { ContagemResponseDto } from './dto/contagem-response.dto';
 import { ConferirEstoqueResponseDto } from './dto/conferir-estoque-response.dto';
 import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
+import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
 
 @Injectable()
 export class EstoqueSaidasService {
@@ -83,6 +84,10 @@ export class EstoqueSaidasService {
 
   async deleteContagem(id: string) {
     return this.repo.deleteContagem(id);
+  }
+
+  async updateContagemGrupo(contagemCuid: string, data: UpdateGrupoContagemDto) {
+    return this.repo.updateContagemGrupo(contagemCuid, data);
   }
 
   async getLogsAgregadosPorContagem(contagemId: string) {
