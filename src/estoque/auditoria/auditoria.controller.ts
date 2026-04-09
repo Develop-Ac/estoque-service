@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Query } from '@nestjs/common';
 import { AuditoriaService } from './auditoria.service';
 import { CreateAuditoriaDto } from './dto/create-auditoria.dto';
 
@@ -12,8 +12,11 @@ export class AuditoriaController {
     }
 
     @Post()
-    async saveAuditoria(@Body() dto: CreateAuditoriaDto) {
-        return this.service.saveAuditoria(dto);
+    async saveAuditoria(
+        @Body() dto: CreateAuditoriaDto,
+        @Headers('x-user-id') userIdHeader?: string,
+    ) {
+        return this.service.saveAuditoria(dto, userIdHeader);
     }
 
     @Get('historico/:cod_produto')

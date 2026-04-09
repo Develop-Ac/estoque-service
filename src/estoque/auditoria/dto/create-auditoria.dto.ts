@@ -4,6 +4,6 @@ export class CreateAuditoriaDto {
     tipo_movimento: 'BAIXA' | 'INCLUSAO' | 'CORRETO';
     quantidade_movimento: number;
     observacao: string;
-    usuario_id: string;
+    usuario_id?: string;
     diferenca_final?: number; // Opcional ou removido, pois agora é calculado
 }

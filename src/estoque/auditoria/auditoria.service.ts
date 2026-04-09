@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EstoqueSaidasService } from '../contagem/contagem.service';
 
@@ -251,8 +251,8 @@ export class AuditoriaService {
         tipo_movimento: 'BAIXA' | 'INCLUSAO' | 'CORRETO';
         quantidade_movimento: number;
         observacao: string;
-        usuario_id: string;
-    }) {
+        usuario_id?: string;
+    }, userIdHeader?: string) {
         let diferenca_final = 0;
         if (dto.tipo_movimento === 'BAIXA') {
             diferenca_final = -Math.abs(dto.quantidade_movimento);
@@ -260,6 +260,20 @@ export class AuditoriaService {
             diferenca_final = Math.abs(dto.quantidade_movimento);
         } else {
             diferenca_final = 0;
+        }
+
+        const resolvedUsuarioId = (userIdHeader || dto.usuario_id || '').trim();
+        if (!resolvedUsuarioId) {
+            throw new BadRequestException('Usuário auditor é obrigatório.');
+        }
+
+        const usuarioExiste = await this.prisma.sis_usuarios.findUnique({
+            where: { id: resolvedUsuarioId },
+            select: { id: true },
+        });
+
+        if (!usuarioExiste) {
+            throw new BadRequestException('Usuário auditor inválido.');
         }
 
         const saved = await this.prisma.est_auditoria.create({
@@ -270,7 +284,7 @@ export class AuditoriaService {
                 tipo_movimento: dto.tipo_movimento,
                 quantidade_movimento: Math.abs(dto.quantidade_movimento),
                 observacao: dto.observacao,
-                usuario_id: dto.usuario_id,
+                usuario_id: resolvedUsuarioId,
                 status: 1
             }
         });
