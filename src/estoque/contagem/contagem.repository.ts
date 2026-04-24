@@ -53,7 +53,7 @@ function formatAndValidateLocation(text: string | null): string | null {
   // Aceita digitos (com opcional CX N) OU a palavra especifica BEBEDOR
   const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:\s+CX\s+\d+)?)\b/);
   if (boxMatch) {
-    return `A-${boxMatch[0]}`;
+    return boxMatch[0];
   }
 
   // BOQUETA
@@ -172,7 +172,7 @@ export class EstoqueSaidasRepository {
       try {
         // APLICA EXTRAÇÃO INTELIGENTE para APLICACOES:
         // Se for "HB20", retorna null. Se for "A1204E02", retorna "A1204E02".
-        // Se for "BOX 03", retorna "A-BOX 03".
+        // Se for "BOX 03", retorna "BOX 03".
         txtApp = formatAndValidateLocation(this.toUtf8Text((row as any).APLICACOES));
       } catch (e) {
         console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
@@ -181,7 +181,7 @@ export class EstoqueSaidasRepository {
 
       try {
         // APLICA FORMATAÇÃO + EXTRAÇÃO para LOCALIZACAO:
-        // O usuário quer que "BOX 03" vire "A-BOX 03" também no campo principal.
+        // O usuário quer que "BOX 03" permaneça "BOX 03" no campo principal.
         // Se a função retornar null (ex: texto irrelevante ou formato desconhecido),
         // mantemos o valor original do banco (fallback), pois LOCALIZACAO é campo mestre.
         const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);

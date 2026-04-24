@@ -121,6 +121,40 @@ describe('EstoqueSaidasRepository', () => {
 
       await expect(repository.fetchSaidas(params)).rejects.toThrow('Empresa inválida');
     });
+
+    it('deve manter LOCALIZACAO como BOX (não A-BOX) quando banco retorna "BOX 03"', async () => {
+      const params = {
+        data_inicial: '2024-01-01',
+        data_final: '2024-01-31',
+        empresa: '3',
+      };
+
+      const mockSaidas = [
+        {
+          data: '2024-01-15',
+          COD_PRODUTO: 99001,
+          DESC_PRODUTO: 'PRODUTO BOX',
+          mar_descricao: 'MARCA X',
+          ref_fabricante: 'REFBOX',
+          ref_FORNECEDOR: 'FORNBOX',
+          LOCALIZACAO: 'BOX 03',
+          unidade: 'UN',
+          APLICACOES: null,
+          codigo_barras: null,
+          QTDE_SAIDA: 2,
+          ESTOQUE: 10,
+          RESERVA: 0,
+        },
+      ];
+
+      openQueryService.query.mockResolvedValue(mockSaidas);
+
+      const result = await repository.fetchSaidas(params);
+
+      // LOCALIZACAO deve permanecer BOX 03, não virar A-BOX 03
+      expect(result[0].LOCALIZACAO).toBe('BOX 03');
+      expect(result[0].LOCALIZACAO).not.toMatch(/^A-BOX/);
+    });
   });
 
   describe('createContagem', () => {
