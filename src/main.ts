@@ -49,17 +49,13 @@ async function bootstrap() {
   );
 
   const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN);
-  // Adicionar frontend local na porta 8081 explicitamente
-  allowedOrigins.push('http://localhost:8081');
-  allowedOrigins.push('http://localhost:8000');
-  allowedOrigins.push('http://localhost:3000');
-  allowedOrigins.push('http://127.0.0.1:8081');
-  allowedOrigins.push('http://192.168.1.145:8081');
-  // Adicionar domínios de produção/intranet
-  allowedOrigins.push('http://contagem.acacessorios.local');
-  allowedOrigins.push('https://contagem.acacessorios.local');
-  allowedOrigins.push('http://intranet.acacessorios.local');
-  allowedOrigins.push('https://intranet.acacessorios.local');
+  // Fallback de desenvolvimento: se CORS_ORIGIN não estiver definida, libera localhost
+  if (allowedOrigins.length === 0) {
+    allowedOrigins.push('http://localhost:3000');
+    allowedOrigins.push('http://localhost:8000');
+    allowedOrigins.push('http://localhost:8081');
+    allowedOrigins.push('http://127.0.0.1:8081');
+  }
 
   app.enableCors({
     origin: (origin, callback) => {
