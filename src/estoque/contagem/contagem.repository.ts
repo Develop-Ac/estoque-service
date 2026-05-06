@@ -49,9 +49,9 @@ function formatAndValidateLocation(text: string | null): string | null {
   const upperApp = text.toUpperCase();
 
   // 1. Regras Especiais (Prioridade Alta)
-  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4)
-  // Aceita digitos (com opcional CX N) OU a palavra especifica BEBEDOR
-  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:\s+CX\s+\d+)?)\b/);
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4, BOX2A02, BOX3B01)
+  // Aceita digitos (com sub-locação opcional tipo A02, B01) OU a palavra especifica BEBEDOR
+  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:[A-Z]\d+)?(?:\s+CX\s+\d+)?)\b/i);
   if (boxMatch) {
     return boxMatch[0];
   }
