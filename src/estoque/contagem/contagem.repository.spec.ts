@@ -27,11 +27,20 @@ describe('EstoqueSaidasRepository', () => {
       findFirst: jest.fn(),
       create: jest.fn(),
       updateMany: jest.fn(),
+      count: jest.fn(),
     },
     est_contagem_itens: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
+      findUnique: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
+      count: jest.fn(),
+    },
+    est_contagem_log: {
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
     },
     $transaction: jest.fn(),
   };
@@ -102,6 +111,113 @@ describe('EstoqueSaidasRepository', () => {
       expect(result).toEqual(mockSaidas);
     });
 
+    it('deve explodir um produto em N linhas, uma por localização distinta', async () => {
+      const params = {
+        data_inicial: '2024-01-01',
+        data_final: '2024-01-31',
+        empresa: '3',
+      };
+
+      // LOCALIZACAO com 2 códigos + APLICACOES com 1 código => 3 locações distintas.
+      const mockSaidas = [
+        {
+          data: '2024-01-15',
+          COD_PRODUTO: 12345,
+          DESC_PRODUTO: 'PRODUTO MULTILOCAL',
+          mar_descricao: 'MARCA',
+          ref_fabricante: 'REF1',
+          ref_FORNECEDOR: 'FORN1',
+          LOCALIZACAO: 'A1204E02 A1305B01',
+          unidade: 'UN',
+          APLICACOES: 'C1010D05',
+          codigo_barras: null,
+          QTDE_SAIDA: 5,
+          ESTOQUE: 100,
+          RESERVA: 10,
+        },
+      ];
+
+      openQueryService.query.mockResolvedValue(mockSaidas);
+
+      const result = await repository.fetchSaidas(params);
+
+      expect(result).toHaveLength(3);
+      const locs = result.map((r) => r.LOCALIZACAO);
+      expect(locs).toEqual(
+        expect.arrayContaining(['A1204E02', 'A1305B01', 'C1010D05']),
+      );
+      // Cada linha vira uma locação única, sem duplicatas, e APLICACOES é zerado.
+      expect(new Set(locs).size).toBe(3);
+      result.forEach((r) => expect(r.APLICACOES).toBeNull());
+    });
+
+    it('deve deduplicar localizações repetidas entre LOCALIZACAO e APLICACOES', async () => {
+      const params = {
+        data_inicial: '2024-01-01',
+        data_final: '2024-01-31',
+        empresa: '3',
+      };
+
+      const mockSaidas = [
+        {
+          data: '2024-01-15',
+          COD_PRODUTO: 555,
+          DESC_PRODUTO: 'PRODUTO REPETIDO',
+          mar_descricao: 'MARCA',
+          ref_fabricante: 'REF1',
+          ref_FORNECEDOR: 'FORN1',
+          LOCALIZACAO: 'A1204E02',
+          unidade: 'UN',
+          APLICACOES: 'A1204E02', // mesma locação => não deve duplicar
+          codigo_barras: null,
+          QTDE_SAIDA: 1,
+          ESTOQUE: 10,
+          RESERVA: 0,
+        },
+      ];
+
+      openQueryService.query.mockResolvedValue(mockSaidas);
+
+      const result = await repository.fetchSaidas(params);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].LOCALIZACAO).toBe('A1204E02');
+    });
+
+    it('deve gerar exatamente uma linha quando a localização não é reconhecida', async () => {
+      const params = {
+        data_inicial: '2024-01-01',
+        data_final: '2024-01-31',
+        empresa: '3',
+      };
+
+      const mockSaidas = [
+        {
+          data: '2024-01-15',
+          COD_PRODUTO: 999,
+          DESC_PRODUTO: 'PRODUTO SEM LOCAL',
+          mar_descricao: 'MARCA',
+          ref_fabricante: 'REF1',
+          ref_FORNECEDOR: 'FORN1',
+          LOCALIZACAO: 'VENDA CASADA', // não bate nas regras => mantém original
+          unidade: 'UN',
+          APLICACOES: 'HB20', // aplicação de veículo, não é locação => ignorado
+          codigo_barras: null,
+          QTDE_SAIDA: 2,
+          ESTOQUE: 20,
+          RESERVA: 0,
+        },
+      ];
+
+      openQueryService.query.mockResolvedValue(mockSaidas);
+
+      const result = await repository.fetchSaidas(params);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].LOCALIZACAO).toBe('VENDA CASADA');
+      expect(result[0].APLICACOES).toBeNull();
+    });
+
     it('deve rejeitar com datas inválidas', async () => {
       const params = {
         data_inicial: 'data-invalida',
@@ -151,7 +267,7 @@ describe('EstoqueSaidasRepository', () => {
 
       const result = await repository.fetchSaidas(params);
 
-      // LOCALIZACAO deve permanecer BOX 03, não virar A-BOX 03
+      // LOCALIZACAO deve permanecer BOX 03, não virar A-BOX 03 (comportamento do Deploy)
       expect(result[0].LOCALIZACAO).toBe('BOX 03');
       expect(result[0].LOCALIZACAO).not.toMatch(/^A-BOX/);
     });
@@ -231,6 +347,7 @@ describe('EstoqueSaidasRepository', () => {
           },
           est_contagem_itens: {
             findMany: jest.fn().mockResolvedValue([]),
+            count: jest.fn().mockResolvedValue(0), // slot livre p/ o identificador
             create: jest.fn().mockResolvedValue(mockItem),
           },
         } as any;
@@ -248,6 +365,51 @@ describe('EstoqueSaidasRepository', () => {
       expect(prismaService.$transaction).toHaveBeenCalled();
       expect(result).toHaveProperty('id', 'contagem-123');
       expect(result).toHaveProperty('itens');
+    });
+
+    it('deve agrupar N localizações do mesmo produto/dia sob um único identificador_item', async () => {
+      const createContagemDto: CreateContagemDto = {
+        colaborador: 'JOÃO DA SILVA',
+        contagem: 1,
+        contagem_cuid: 'grupo-123',
+        produtos: [
+          // 3 localizações do MESMO produto/dia (já explodidas pelo fetchSaidas)
+          { DATA: '2024-01-15', COD_PRODUTO: 12345, DESC_PRODUTO: 'P', MAR_DESCRICAO: 'M', REF_FABRICANTE: 'R', REF_FORNECEDOR: 'F', LOCALIZACAO: 'A1204E02', UNIDADE: 'UN', QTDE_SAIDA: 1, ESTOQUE: 30, RESERVA: 0 },
+          { DATA: '2024-01-15', COD_PRODUTO: 12345, DESC_PRODUTO: 'P', MAR_DESCRICAO: 'M', REF_FABRICANTE: 'R', REF_FORNECEDOR: 'F', LOCALIZACAO: 'A1305B01', UNIDADE: 'UN', QTDE_SAIDA: 1, ESTOQUE: 30, RESERVA: 0 },
+          { DATA: '2024-01-15', COD_PRODUTO: 12345, DESC_PRODUTO: 'P', MAR_DESCRICAO: 'M', REF_FABRICANTE: 'R', REF_FORNECEDOR: 'F', LOCALIZACAO: 'C1010D05', UNIDADE: 'UN', QTDE_SAIDA: 1, ESTOQUE: 30, RESERVA: 0 },
+        ],
+      };
+
+      mockPrismaService.sis_usuarios.findFirst.mockResolvedValue({
+        id: 'user-456', nome: 'JOÃO DA SILVA', codigo: 'JS001', setor: 'ESTOQUE', senha: 'h', trash: 0,
+      });
+
+      const createdItems: any[] = [];
+      mockPrismaService.$transaction.mockImplementation(async (callback) => {
+        const txMock = {
+          est_contagem: {
+            create: jest.fn().mockResolvedValue({ id: 'contagem-123', contagem_cuid: 'grupo-123', usuario: {} }),
+          },
+          est_contagem_itens: {
+            findMany: jest.fn().mockResolvedValue([]),
+            count: jest.fn().mockResolvedValue(0), // nenhuma sessão anterior
+            create: jest.fn().mockImplementation(({ data }) => {
+              createdItems.push(data);
+              return Promise.resolve({ id: `item-${createdItems.length}`, ...data });
+            }),
+          },
+        } as any;
+        return callback(txMock as any);
+      });
+
+      await repository.createContagem(createContagemDto);
+
+      // As 3 localizações foram criadas...
+      expect(createdItems).toHaveLength(3);
+      // ...todas com o MESMO identificador_item (base, sem versionar).
+      const identificadores = new Set(createdItems.map((i) => i.identificador_item));
+      expect(identificadores.size).toBe(1);
+      expect([...identificadores][0]).toBe('12345-2024-01-15');
     });
 
     it('deve rejeitar se colaborador não encontrado', async () => {
@@ -363,13 +525,13 @@ describe('EstoqueSaidasRepository', () => {
         },
       ];
 
-      mockPrismaService.sis_usuarios.findUnique.mockResolvedValue(mockUsuario);
+      mockPrismaService.sis_usuarios.findFirst.mockResolvedValue(mockUsuario);
       mockPrismaService.est_contagem.findMany.mockResolvedValue(mockContagens);
       mockPrismaService.est_contagem_itens.findMany.mockResolvedValue(mockItens);
 
       const result = await repository.getContagensByUsuario(idUsuario);
 
-      expect(mockPrismaService.sis_usuarios.findUnique).toHaveBeenCalledWith({
+      expect(mockPrismaService.sis_usuarios.findFirst).toHaveBeenCalledWith({
         where: { id: idUsuario, trash: 0 },
       });
       expect(mockPrismaService.est_contagem.findMany).toHaveBeenCalledWith({
@@ -393,7 +555,7 @@ describe('EstoqueSaidasRepository', () => {
     it('deve rejeitar se usuário não encontrado', async () => {
       const idUsuario = 'user-inexistente';
 
-      mockPrismaService.sis_usuarios.findUnique.mockResolvedValue(null);
+      mockPrismaService.sis_usuarios.findFirst.mockResolvedValue(null);
 
       await expect(repository.getContagensByUsuario(idUsuario)).rejects.toThrow(
         'Usuário com ID "user-inexistente" não encontrado',
@@ -402,27 +564,42 @@ describe('EstoqueSaidasRepository', () => {
   });
 
   describe('updateItemConferir', () => {
-    it('deve atualizar campo conferir do item', async () => {
+    it('deve confiar no front e atualizar conferir quando o item ainda não tem logs', async () => {
+      const identificador = '12345-2024-01-15';
       const itemId = 'item-123';
       const conferir = true;
 
-      const mockUpdatedItem = {
+      const mockItem = {
         id: 'item-123',
-        conferir: true,
+        identificador_item: identificador,
         contagem_cuid: 'grupo-456',
         cod_produto: 12345,
         desc_produto: 'PRODUTO TESTE',
+        estoque: 100,
       };
 
+      const mockUpdatedItem = { ...mockItem, conferir: true };
+
+      // Sem logs => o método confia no valor do front e faz update simples.
+      mockPrismaService.est_contagem_itens.findUnique.mockResolvedValue(mockItem);
+      mockPrismaService.est_contagem_log.findMany.mockResolvedValue([]);
       mockPrismaService.est_contagem_itens.update.mockResolvedValue(mockUpdatedItem);
 
-      const result = await repository.updateItemConferir(itemId, conferir);
+      const result = await repository.updateItemConferir(identificador, conferir, itemId);
 
       expect(mockPrismaService.est_contagem_itens.update).toHaveBeenCalledWith({
         where: { id: itemId },
         data: { conferir },
       });
       expect(result).toEqual(mockUpdatedItem);
+    });
+
+    it('deve lançar erro se o item de contagem não existir', async () => {
+      mockPrismaService.est_contagem_itens.findUnique.mockResolvedValue(null);
+
+      await expect(
+        repository.updateItemConferir('id-x', true, 'item-inexistente'),
+      ).rejects.toThrow('Item de contagem não encontrado');
     });
   });
 
@@ -470,10 +647,10 @@ describe('EstoqueSaidasRepository', () => {
   });
 
   describe('updateLiberadoContagem', () => {
-    it('deve liberar contagem tipo 2 quando recebe contagem tipo 1', async () => {
+    it('deve liberar contagem tipo 2 quando há divergência na contagem tipo 1', async () => {
       const contagem_cuid = 'grupo-123';
       const contagem = 1;
-      const divergencia = false;
+      const divergencia = true; // divergência confirmada pelo front
 
       const mockContagemLiberada = {
         id: 'contagem-456',
@@ -485,20 +662,21 @@ describe('EstoqueSaidasRepository', () => {
       };
 
       mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 }) // Para desabilitar contagem atual
-        .mockResolvedValueOnce({ count: 1 }); // Para liberar próxima contagem
-
+        .mockResolvedValueOnce({ count: 1 }) // trava a contagem atual
+        .mockResolvedValueOnce({ count: 1 }); // libera a próxima
+      // Há contagem tipo 2 para liberar
+      mockPrismaService.est_contagem.findMany.mockResolvedValue([{ id: 'contagem-456' }]);
       mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemLiberada);
 
       const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
 
-      // Primeira chamada: desabilita contagem tipo 1
+      // Primeira chamada: trava a contagem tipo 1
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(1, {
         where: { contagem_cuid, contagem: 1 },
         data: { liberado_contagem: false },
       });
 
-      // Segunda chamada: libera contagem tipo 2
+      // Segunda chamada: libera a contagem tipo 2
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(2, {
         where: { contagem_cuid, contagem: 2 },
         data: { liberado_contagem: true },
@@ -507,13 +685,13 @@ describe('EstoqueSaidasRepository', () => {
       expect(result).toEqual(mockContagemLiberada);
     });
 
-    it('deve liberar contagem tipo 3 quando recebe contagem tipo 2', async () => {
+    it('deve liberar contagem tipo 3 quando há divergência na contagem tipo 2', async () => {
       const contagem_cuid = 'grupo-123';
       const contagem = 2;
-      const divergencia = false;
+      const divergencia = true;
 
       const mockContagemLiberada = {
-        id: 'contagem-456',
+        id: 'contagem-789',
         contagem_cuid: 'grupo-123',
         contagem: 3,
         liberado_contagem: true,
@@ -522,20 +700,13 @@ describe('EstoqueSaidasRepository', () => {
       };
 
       mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 }) // Para desabilitar contagem atual
-        .mockResolvedValueOnce({ count: 1 }); // Para liberar próxima contagem
-
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 1 });
+      mockPrismaService.est_contagem.findMany.mockResolvedValue([{ id: 'contagem-789' }]);
       mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemLiberada);
 
       const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
 
-      // Primeira chamada: desabilita contagem tipo 2
-      expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(1, {
-        where: { contagem_cuid, contagem: 2 },
-        data: { liberado_contagem: false },
-      });
-
-      // Segunda chamada: libera contagem tipo 3
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(2, {
         where: { contagem_cuid, contagem: 3 },
         data: { liberado_contagem: true },
@@ -544,18 +715,48 @@ describe('EstoqueSaidasRepository', () => {
       expect(result).toEqual(mockContagemLiberada);
     });
 
-    it('deve rejeitar se contagem para liberar não encontrada', async () => {
-      const contagem_cuid = 'grupo-inexistente';
+    it('não deve liberar próxima contagem na contagem tipo 3 (última)', async () => {
+      const contagem_cuid = 'grupo-123';
+      const contagem = 3;
+      const divergencia = true;
+
+      mockPrismaService.est_contagem.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // trava atual
+        .mockResolvedValueOnce({ count: 1 }); // retorno antecipado (sem próxima)
+
+      await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+
+      // Na contagem 3 não existe "próxima" para liberar com liberado_contagem: true
+      const chamadasLiberando = mockPrismaService.est_contagem.updateMany.mock.calls.filter(
+        ([arg]) => arg?.data?.liberado_contagem === true,
+      );
+      expect(chamadasLiberando).toHaveLength(0);
+    });
+
+    it('não deve liberar próxima contagem quando não há divergência', async () => {
+      const contagem_cuid = 'grupo-123';
       const contagem = 1;
       const divergencia = false;
 
-      mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 }) // Para desabilitar contagem atual
-        .mockResolvedValueOnce({ count: 0 }); // Para liberar próxima contagem (não encontrada)
+      const mockContagemAtual = {
+        id: 'contagem-123',
+        contagem_cuid: 'grupo-123',
+        contagem: 1,
+        liberado_contagem: false,
+      };
 
-      await expect(repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia)).rejects.toThrow(
-        'Nenhuma contagem encontrada com contagem_cuid "grupo-inexistente" e tipo 2',
+      mockPrismaService.est_contagem.updateMany.mockResolvedValue({ count: 1 });
+      // Sem itens => não há como calcular divergência => nada é liberado
+      mockPrismaService.est_contagem_itens.findMany.mockResolvedValue([]);
+      mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemAtual);
+
+      const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+
+      const chamadasLiberando = mockPrismaService.est_contagem.updateMany.mock.calls.filter(
+        ([arg]) => arg?.data?.liberado_contagem === true,
       );
+      expect(chamadasLiberando).toHaveLength(0);
+      expect(result).toEqual(mockContagemAtual);
     });
   });
 
@@ -644,7 +845,7 @@ describe('EstoqueSaidasRepository', () => {
   });
 
   describe('getAllContagens', () => {
-    it('deve retornar todas as contagens com itens', async () => {
+    it('deve retornar contagens paginadas com total e last_page', async () => {
       const mockContagens = [
         {
           id: 'contagem-123',
@@ -652,13 +853,10 @@ describe('EstoqueSaidasRepository', () => {
           contagem: 1,
           contagem_cuid: 'grupo-456',
           liberado_contagem: true,
+          status: 0,
           created_at: new Date('2024-01-15T10:00:00Z'),
-          usuario: {
-            id: 'user-123',
-            nome: 'JOÃO DA SILVA',
-            codigo: 'JS001',
-          },
-          logs: []
+          usuario: { id: 'user-123', nome: 'JOÃO DA SILVA', codigo: 'JS001' },
+          logs: [],
         },
         {
           id: 'contagem-456',
@@ -666,132 +864,51 @@ describe('EstoqueSaidasRepository', () => {
           contagem: 2,
           contagem_cuid: 'grupo-789',
           liberado_contagem: false,
+          status: 0,
           created_at: new Date('2024-01-16T10:00:00Z'),
-          usuario: {
-            id: 'user-456',
-            nome: 'MARIA SANTOS',
-            codigo: 'MS002',
-          },
-          logs: []
+          usuario: { id: 'user-456', nome: 'MARIA SANTOS', codigo: 'MS002' },
+          logs: [],
         },
       ];
 
-      const mockItens1 = [
-        {
-          id: 'item-789',
-          contagem_cuid: 'grupo-456',
-          data: new Date('2024-01-15T00:00:00Z'),
-          cod_produto: 12345,
-          desc_produto: 'PRODUTO TESTE',
-          mar_descricao: 'MARCA TESTE',
-          ref_fabricante: 'REF123',
-          ref_fornecedor: 'FORN123',
-          localizacao: 'A01-B02',
-          unidade: 'UN',
-          qtde_saida: 5,
-          estoque: 100,
-          reserva: 10,
-          conferir: false,
-        },
-      ];
-
-      const mockItens2 = [
-        {
-          id: 'item-101',
-          contagem_cuid: 'grupo-789',
-          data: new Date('2024-01-16T00:00:00Z'),
-          cod_produto: 67890,
-          desc_produto: 'OUTRO PRODUTO TESTE',
-          mar_descricao: 'OUTRA MARCA',
-          ref_fabricante: 'REF456',
-          ref_fornecedor: 'FORN456',
-          localizacao: 'B02-C03',
-          unidade: 'PC',
-          qtde_saida: 3,
-          estoque: 50,
-          reserva: 5,
-          conferir: true,
-        },
-      ];
-
+      mockPrismaService.est_contagem.count.mockResolvedValue(2);
       mockPrismaService.est_contagem.findMany.mockResolvedValue(mockContagens);
-
-      const result = await repository.getAllContagens();
-
-      expect(mockPrismaService.est_contagem.findMany).toHaveBeenCalledWith({
-        include: {
-          usuario: {
-            select: {
-              id: true,
-              nome: true,
-              codigo: true,
-            },
-          },
-          logs: {
-            select: {
-              id: true,
-              contagem_id: true,
-              usuario_id: true,
-              item_id: true,
-              estoque: true,
-              contado: true,
-              created_at: true
-            },
-            orderBy: {
-              created_at: 'desc'
-            }
-          }
-        },
-        orderBy: {
-          created_at: 'desc',
-        },
+      mockPrismaService.est_contagem_itens.findFirst.mockResolvedValue({
+        data: new Date('2024-01-15T00:00:00Z'),
       });
+      mockPrismaService.est_contagem_log.findFirst.mockResolvedValue(null);
 
-      expect(result).toHaveLength(2);
-      expect(result[0]).not.toHaveProperty('itens');
-      expect(result[1]).not.toHaveProperty('itens');
-      expect(result[0].usuario.nome).toBe('JOÃO DA SILVA');
-      expect(result[1].usuario.nome).toBe('MARIA SANTOS');
+      const result = await repository.getAllContagens({ page: 1, pageSize: 20 });
+
+      // Paginação aplicada
+      expect(mockPrismaService.est_contagem.count).toHaveBeenCalledWith({
+        where: { status: 0 },
+      });
+      expect(mockPrismaService.est_contagem.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ skip: 0, take: 20 }),
+      );
+
+      // Novo formato de retorno
+      expect(result.total).toBe(2);
+      expect(result.page).toBe(1);
+      expect(result.last_page).toBe(1);
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0].usuario.nome).toBe('JOÃO DA SILVA');
+      expect(result.data[0]).toHaveProperty('grupo_iniciado', false);
     });
 
-    it('deve retornar array vazio quando não há contagens', async () => {
+    it('deve retornar data vazio quando não há contagens', async () => {
+      mockPrismaService.est_contagem.count.mockResolvedValue(0);
       mockPrismaService.est_contagem.findMany.mockResolvedValue([]);
 
       const result = await repository.getAllContagens();
 
-      expect(mockPrismaService.est_contagem.findMany).toHaveBeenCalledWith({
-        include: {
-          usuario: {
-            select: {
-              id: true,
-              nome: true,
-              codigo: true,
-            },
-          },
-          logs: {
-            select: {
-              id: true,
-              contagem_id: true,
-              usuario_id: true,
-              item_id: true,
-              estoque: true,
-              contado: true,
-              created_at: true
-            },
-            orderBy: {
-              created_at: 'desc'
-            }
-          }
-        },
-        orderBy: {
-          created_at: 'desc',
-        },
-      });
-
-      expect(result).toEqual([]);
+      expect(result.data).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(result.last_page).toBe(0);
     });
 
-    it('deve retornar contagens sem itens quando contagem_cuid é null', async () => {
+    it('deve tratar contagem com contagem_cuid null sem quebrar', async () => {
       const mockContagens = [
         {
           id: 'contagem-123',
@@ -799,21 +916,23 @@ describe('EstoqueSaidasRepository', () => {
           contagem: 1,
           contagem_cuid: null,
           liberado_contagem: true,
+          status: 0,
           created_at: new Date('2024-01-15T10:00:00Z'),
-          usuario: {
-            id: 'user-123',
-            nome: 'JOÃO DA SILVA',
-            codigo: 'JS001',
-          },
+          usuario: { id: 'user-123', nome: 'JOÃO DA SILVA', codigo: 'JS001' },
+          logs: [],
         },
       ];
 
+      mockPrismaService.est_contagem.count.mockResolvedValue(1);
       mockPrismaService.est_contagem.findMany.mockResolvedValue(mockContagens);
+      mockPrismaService.est_contagem_itens.findFirst.mockResolvedValue(null);
 
       const result = await repository.getAllContagens();
 
-      expect(result).toHaveLength(1);
-      expect(result[0]).not.toHaveProperty('itens');
+      expect(result.data).toHaveLength(1);
+      // Sem CUID e sem item => grupo não iniciado e sem itens
+      expect(result.data[0].grupo_iniciado).toBe(false);
+      expect(result.data[0].itens).toEqual([]);
     });
   });
 });

@@ -83,6 +83,44 @@ function formatAndValidateLocation(text: string | null): string | null {
   return null;
 }
 
+// Versão "N locações" de formatAndValidateLocation: em vez de juntar os códigos
+// encontrados numa única string, devolve a LISTA de locações reconhecidas.
+// Espelha exatamente as mesmas regras (inclusive o BOX sem prefixo "A-").
+// - Regras especiais (BOX, BOQUETA, CX ESCADA) => 1 locação.
+// - Padrão de código (Letra+Núm+Letra+Núm) => N locações (uma por código).
+// - Nada reconhecido => lista vazia (deixa o chamador decidir o fallback).
+function extractLocations(text: string | null): string[] {
+  if (!text) return [];
+
+  const upperApp = text.toUpperCase();
+
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4, BOX2A02, BOX3B01)
+  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:[A-Z]\d+)?(?:\s+CX\s+\d+)?)\b/i);
+  if (boxMatch) {
+    return [boxMatch[0]];
+  }
+
+  // BOQUETA
+  if (upperApp.includes('BOQUETA')) {
+    return ['A-BOQUETA'];
+  }
+
+  // CAIXA ESCADA / CX ESCADA
+  if (upperApp.match(/\b(?:CX|CAIXA)\s*ESCADA\b/)) {
+    return ['A-CX ESCADA'];
+  }
+
+  // Padrão de código: Letra + 2-4 Números + Letra + 1-2 Números (ex.: A1204E02).
+  // Um mesmo campo pode conter VÁRIOS códigos -> cada um vira uma locação.
+  const codeRegex = /\b[A-Z]\d{2,4}[A-Z]\d{1,2}\b/gi;
+  const matches = text.match(codeRegex);
+  if (matches && matches.length > 0) {
+    return matches;
+  }
+
+  return [];
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -165,51 +203,61 @@ export class EstoqueSaidasRepository {
     // Executa via .query para retornar recordset
     const rows = await this.oq.query<EstoqueSaidaRow>(outerSql, {}, { timeout: 300_000 });
 
-    const sanitizedRows = (rows ?? []).map((row, i) => {
-      let txtApp: string | null;
-      let txtLoc: string | null;
+    // Explode cada produto em N linhas — uma por localização DISTINTA.
+    // Tanto LOCALIZACAO (campo mestre) quanto APLICACOES (campo secundário) podem,
+    // cada um, conter VÁRIAS locações. Antes a lógica gerava no máximo 2 linhas por
+    // produto (1 p/ LOCALIZACAO + 1 p/ APLICACOES); agora geramos N (uma por locação,
+    // sem duplicatas) para suportar produtos com mais de duas localizações.
+    const result: EstoqueSaidaRow[] = [];
 
-      try {
-        // APLICA EXTRAÇÃO INTELIGENTE para APLICACOES:
-        // Se for "HB20", retorna null. Se for "A1204E02", retorna "A1204E02".
-        // Se for "BOX 03", retorna "BOX 03".
-        txtApp = formatAndValidateLocation(this.toUtf8Text((row as any).APLICACOES));
-      } catch (e) {
-        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
-        txtApp = null;
-      }
+    (rows ?? []).forEach((row, i) => {
+      const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+      const rawApp = this.toUtf8Text((row as any).APLICACOES);
 
+      // Locações do campo mestre. Se nenhuma regra reconhecer, mantemos o valor
+      // original do ERP como locação única (confiança no ERP).
+      let locsPrincipais: string[];
       try {
-        // APLICA FORMATAÇÃO + EXTRAÇÃO para LOCALIZACAO:
-        // O usuário quer que "BOX 03" permaneça "BOX 03" no campo principal.
-        // Se a função retornar null (ex: texto irrelevante ou formato desconhecido),
-        // mantemos o valor original do banco (fallback), pois LOCALIZACAO é campo mestre.
-        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
-        const formattedLoc = formatAndValidateLocation(rawLoc);
-        txtLoc = formattedLoc ?? rawLoc; // Se não validar/formatar, usa o original (confiança no ERP)
+        const extraidas = extractLocations(rawLoc);
+        locsPrincipais = extraidas.length > 0 ? extraidas : (rawLoc ? [rawLoc] : []);
       } catch (e) {
         console.error('Falha ao converter LOCALIZACAO na linha', i, row?.COD_PRODUTO, e);
-        txtLoc = (row as any).LOCALIZACAO;
+        locsPrincipais = rawLoc ? [rawLoc] : [];
       }
 
-      return { ...row, APLICACOES: txtApp, LOCALIZACAO: txtLoc };
+      // Locações do campo APLICACOES: só entram se passarem nas regras
+      // (ex.: "HB20" é aplicação de veículo, não locação -> ignorado).
+      let locsAplicacoes: string[];
+      try {
+        locsAplicacoes = extractLocations(rawApp);
+      } catch (e) {
+        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
+        locsAplicacoes = [];
+      }
+
+      // Une (mestre primeiro), removendo duplicatas (case-insensitive).
+      const seen = new Set<string>();
+      const locacoes: string[] = [];
+      for (const loc of [...locsPrincipais, ...locsAplicacoes]) {
+        const valor = loc?.trim();
+        if (!valor) continue;
+        const key = valor.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locacoes.push(valor);
+      }
+
+      // Emite uma linha por locação. Se nada foi reconhecido, emite o item uma vez
+      // (com a localização original) para não sumir com o produto da contagem.
+      if (locacoes.length === 0) {
+        result.push({ ...row, LOCALIZACAO: rawLoc, APLICACOES: null });
+        return;
+      }
+
+      for (const loc of locacoes) {
+        result.push({ ...row, LOCALIZACAO: loc, APLICACOES: null });
+      }
     });
-
-    // Duplica os itens conforme solicitado APENAS SE TIPO = 2 (AVULSA)
-    const result: EstoqueSaidaRow[] = [];
-    for (const item of sanitizedRows) {
-      result.push(item);
-
-      // Só cria o segundo item se APLICACOES for válido (não nulo)
-      if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
-        // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
-        result.push({
-          ...item,
-          LOCALIZACAO: item.APLICACOES,
-          APLICACOES: null
-        });
-      }
-    }
 
     return result;
   }
@@ -318,58 +366,69 @@ export class EstoqueSaidasRepository {
       let itens: any[] = [];
 
       if (itensExistentes.length === 0) {
-        // Criar os itens associados ao contagem_cuid
+        // Agrupa os produtos por (COD_PRODUTO + data do movimento). Cada grupo é um
+        // produto/dia que pode ter N localizações — e TODAS precisam compartilhar o
+        // MESMO identificador_item para a validação de multilocação (soma das locações
+        // x estoque total) funcionar. Antes havia um limite implícito de 2 locações
+        // por identificador (slots de 2): a 3ª locação caía em "-v2" e saía do grupo.
+        const gruposPorProduto = new Map<string, typeof produtosSanitizados>();
         for (const produto of produtosSanitizados) {
-          // Extrai apenas a data no formato yyyy-mm-dd
           const dataStr = produto.DATA instanceof Date
             ? produto.DATA.toISOString().slice(0, 10)
             : String(produto.DATA).slice(0, 10);
+          const chaveBase = `${produto.COD_PRODUTO}-${dataStr}`;
+          const grupo = gruposPorProduto.get(chaveBase);
+          if (grupo) grupo.push(produto);
+          else gruposPorProduto.set(chaveBase, [produto]);
+        }
 
-          // Lógica de Versionamento Automático (Slots de 2)
-          // 1. Tenta o ID Base (v1)
-          let targetIdentificador = `${produto.COD_PRODUTO}-${dataStr}`;
+        // Criar os itens associados ao contagem_cuid — um identificador por grupo.
+        for (const [chaveBase, produtosDoGrupo] of gruposPorProduto) {
+          // Encontra uma versão de identificador ainda NÃO usada por outra sessão de
+          // contagem do mesmo produto/dia (evita colisão/mistura de logs entre sessões).
+          let targetIdentificador = chaveBase;
           let version = 1;
-
-          // Loop para encontrar um identificador com slot livre (< 2 usos)
           while (true) {
             const usageCount = await tx.est_contagem_itens.count({
               where: { identificador_item: targetIdentificador }
             });
 
-            if (usageCount < 2) {
-              // Slot livre encontrado!
+            if (usageCount === 0) {
+              // Identificador livre para esta sessão.
               break;
             }
 
-            // Slot cheio (já existem 2 locais para este ID). Tenta próxima versão.
+            // Já usado por uma sessão anterior. Tenta a próxima versão.
             version++;
-            targetIdentificador = `${produto.COD_PRODUTO}-${dataStr}-v${version}`;
+            targetIdentificador = `${chaveBase}-v${version}`;
           }
 
-          // Log de debug para confirmar versão gerada
           if (version > 1) {
-            console.log(`[AUTO-VERSION] Produto ${produto.COD_PRODUTO} excedeu limite diário. Gerando versão: ${targetIdentificador}`);
+            console.log(`[AUTO-VERSION] Produto/dia ${chaveBase} já contado em outra sessão. Gerando versão: ${targetIdentificador}`);
           }
 
-          const item = await tx.est_contagem_itens.create({
-            data: {
-              identificador_item: targetIdentificador, // Usando o ID versionado
-              contagem_cuid: grupoContagem,
-              data: produto.DATA, // salva apenas yyyy-mm-dd
-              cod_produto: produto.COD_PRODUTO,
-              desc_produto: produto.DESC_PRODUTO ?? '',
-              mar_descricao: produto.MAR_DESCRICAO,
-              ref_fabricante: produto.REF_FABRICANTE,
-              ref_fornecedor: produto.REF_FORNECEDOR,
-              localizacao: produto.LOCALIZACAO,
-              unidade: produto.UNIDADE,
-              aplicacoes: produto.APLICACOES,
-              qtde_saida: produto.QTDE_SAIDA,
-              estoque: produto.ESTOQUE,
-              reserva: produto.RESERVA,
-            },
-          });
-          itens.push(item);
+          // Todas as N localizações deste produto/dia recebem o MESMO identificador.
+          for (const produto of produtosDoGrupo) {
+            const item = await tx.est_contagem_itens.create({
+              data: {
+                identificador_item: targetIdentificador,
+                contagem_cuid: grupoContagem,
+                data: produto.DATA, // salva apenas yyyy-mm-dd
+                cod_produto: produto.COD_PRODUTO,
+                desc_produto: produto.DESC_PRODUTO ?? '',
+                mar_descricao: produto.MAR_DESCRICAO,
+                ref_fabricante: produto.REF_FABRICANTE,
+                ref_fornecedor: produto.REF_FORNECEDOR,
+                localizacao: produto.LOCALIZACAO,
+                unidade: produto.UNIDADE,
+                aplicacoes: produto.APLICACOES,
+                qtde_saida: produto.QTDE_SAIDA,
+                estoque: produto.ESTOQUE,
+                reserva: produto.RESERVA,
+              },
+            });
+            itens.push(item);
+          }
         }
       } else {
         itens = itensExistentes;
