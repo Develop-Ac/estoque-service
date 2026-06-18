@@ -22,6 +22,7 @@ import { UpdateLiberadoContagemDto } from './dto/update-liberado-contagem.dto';
 import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
 import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
+import { BuscarProdutosQueryDto } from './dto/buscar-produtos.query.dto';
 
 @ApiTags('Estoque')
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
@@ -95,6 +96,69 @@ export class EstoqueSaidasController {
   async getSaidas(@Query() q: GetSaidasQueryDto): Promise<EstoqueSaidaRow[]> {
     const { data_inicial, data_final, empresa = '3', tipo } = q;
     return this.service.listarSaidas({ data_inicial, data_final, empresa, tipo });
+  }
+
+  // ===== CONTAGEM AVULSA =====
+  // ATENÇÃO: estas rotas estáticas DEVEM ficar antes de @Get(':id_usuario'),
+  // senão seriam capturadas pela rota com parâmetro.
+
+  @Get('produtos')
+  @ApiOperation({
+    summary: 'Buscar produtos para contagem avulsa',
+    description:
+      'Lista produtos do cadastro aplicando filtros (grupo, subgrupo, marca, descrição, código). ' +
+      'Exige ao menos um filtro. Use para montar uma contagem avulsa (tipo=2).'
+  })
+  @ApiOkResponse({ description: 'Lista de produtos filtrados', type: EstoqueSaidaResponseDto, isArray: true })
+  @ApiBadRequestResponse({ description: 'Nenhum filtro informado ou parâmetros inválidos' })
+  async buscarProdutos(@Query() q: BuscarProdutosQueryDto): Promise<EstoqueSaidaRow[]> {
+    // Coerção manual: não há ValidationPipe global com transform, então os query
+    // params chegam como string. Trata '' como ausente para não filtrar por 0.
+    const toNum = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const toBool = (v: any, def: boolean): boolean => {
+      if (v === undefined || v === null || String(v).trim() === '') return def;
+      if (typeof v === 'boolean') return v;
+      const s = String(v).toLowerCase();
+      return s === 'true' || s === '1';
+    };
+    const empresa = q.empresa && String(q.empresa).trim() ? String(q.empresa).trim() : '3';
+
+    return this.service.buscarProdutosPorFiltro({
+      empresa,
+      cod_produto: toNum(q.cod_produto),
+      marca: toNum(q.marca),
+      descricao: typeof q.descricao === 'string' ? q.descricao : undefined,
+      grupo: toNum(q.grupo),
+      subgrupo: toNum(q.subgrupo),
+      somente_com_saldo: toBool(q.somente_com_saldo, true),
+    });
+  }
+
+  @Get('grupos')
+  @ApiOperation({ summary: 'Listar grupos de produto (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  async getGrupos(@Query('empresa') empresa = '3') {
+    return this.service.listarGrupos(empresa);
+  }
+
+  @Get('subgrupos')
+  @ApiOperation({ summary: 'Listar subgrupos de produto (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'grupo', required: false, example: 1, type: 'number', description: 'Filtra subgrupos por grupo (GRP_CODIGO)' })
+  async getSubgrupos(@Query('empresa') empresa = '3', @Query('grupo') grupo?: string) {
+    const grp = grupo !== undefined && grupo !== '' ? Number(grupo) : undefined;
+    return this.service.listarSubgrupos(empresa, grp);
+  }
+
+  @Get('marcas')
+  @ApiOperation({ summary: 'Listar marcas (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  async getMarcas(@Query('empresa') empresa = '3') {
+    return this.service.listarMarcas(empresa);
   }
 
   @Get('lista')

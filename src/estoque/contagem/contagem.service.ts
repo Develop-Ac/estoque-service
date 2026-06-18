@@ -21,6 +21,31 @@ export class EstoqueSaidasService {
     return this.repo.fetchSaidas(filters);
   }
 
+  // ===== CONTAGEM AVULSA =====
+  async buscarProdutosPorFiltro(filters: {
+    empresa: string;
+    cod_produto?: number;
+    marca?: number;
+    descricao?: string;
+    grupo?: number;
+    subgrupo?: number;
+    somente_com_saldo?: boolean;
+  }): Promise<EstoqueSaidaRow[]> {
+    return this.repo.fetchProdutosPorFiltro(filters);
+  }
+
+  async listarGrupos(empresa: string) {
+    return this.repo.fetchGrupos(empresa);
+  }
+
+  async listarSubgrupos(empresa: string, grupo?: number) {
+    return this.repo.fetchSubgrupos(empresa, grupo);
+  }
+
+  async listarMarcas(empresa: string) {
+    return this.repo.fetchMarcas(empresa);
+  }
+
   async createContagem(createContagemDto: CreateContagemDto): Promise<ContagemResponseDto> {
     try {
       const result = await this.repo.createContagem(createContagemDto);

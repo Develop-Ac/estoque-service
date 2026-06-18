@@ -19,7 +19,15 @@ export class ContagemResponseDto {
     enum: [1, 2, 3]
   })
   contagem!: number;
-  
+
+  @ApiProperty({
+    description: 'Origem da contagem (1=Diária/Rotativa, 2=Avulsa)',
+    example: 1,
+    enum: [1, 2],
+    required: false
+  })
+  tipo?: number;
+
   @ApiProperty({
     description: 'Identificador comum para agrupar as 3 contagens criadas simultaneamente',
     example: 'clx1234567890group',

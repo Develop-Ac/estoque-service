@@ -139,6 +139,16 @@ export class CreateContagemDto {
 
   piso?: string;
 
+  @ApiProperty({
+    description: 'Tipo da contagem (1=Diária/Rotativa, 2=Avulsa)',
+    example: 1,
+    enum: [1, 2],
+    required: false
+  })
+  @IsOptional()
+  @IsNumber()
+  tipo?: number;
+
   @IsString()
   usuario: string
 }

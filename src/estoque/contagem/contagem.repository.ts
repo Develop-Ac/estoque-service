@@ -262,6 +262,214 @@ export class EstoqueSaidasRepository {
     return result;
   }
 
+  /**
+   * Explode cada linha de produto em N linhas — uma por localização distinta —
+   * usando exatamente as mesmas regras de multilocação da contagem rotativa
+   * (campo mestre LOCALIZACAO + campo secundário APLICACOES).
+   */
+  private explodeByLocation(rows: EstoqueSaidaRow[] | undefined): EstoqueSaidaRow[] {
+    const result: EstoqueSaidaRow[] = [];
+
+    (rows ?? []).forEach((row, i) => {
+      const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+      const rawApp = this.toUtf8Text((row as any).APLICACOES);
+
+      let locsPrincipais: string[];
+      try {
+        const extraidas = extractLocations(rawLoc);
+        locsPrincipais = extraidas.length > 0 ? extraidas : (rawLoc ? [rawLoc] : []);
+      } catch (e) {
+        console.error('Falha ao converter LOCALIZACAO na linha', i, row?.COD_PRODUTO, e);
+        locsPrincipais = rawLoc ? [rawLoc] : [];
+      }
+
+      let locsAplicacoes: string[];
+      try {
+        locsAplicacoes = extractLocations(rawApp);
+      } catch (e) {
+        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
+        locsAplicacoes = [];
+      }
+
+      const seen = new Set<string>();
+      const locacoes: string[] = [];
+      for (const loc of [...locsPrincipais, ...locsAplicacoes]) {
+        const valor = loc?.trim();
+        if (!valor) continue;
+        const key = valor.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locacoes.push(valor);
+      }
+
+      if (locacoes.length === 0) {
+        result.push({ ...row, LOCALIZACAO: rawLoc, APLICACOES: null });
+        return;
+      }
+
+      for (const loc of locacoes) {
+        result.push({ ...row, LOCALIZACAO: loc, APLICACOES: null });
+      }
+    });
+
+    return result;
+  }
+
+  /**
+   * CONTAGEM AVULSA: busca produtos do CADASTRO (não da movimentação) aplicando
+   * filtros escolhidos pelo usuário (grupo/subgrupo/marca/descrição/código).
+   * Diferente da rotativa, não há filtro por lanctos_estoque; QTDE_SAIDA = 0 e a
+   * DATA do item é a data atual (CURRENT_DATE). Exige ao menos um filtro para não
+   * trazer o catálogo inteiro.
+   */
+  async fetchProdutosPorFiltro(params: {
+    empresa: string;       // '3' por default
+    cod_produto?: number;
+    marca?: number;        // MAR_CODIGO
+    descricao?: string;    // LIKE em PRO.pro_descricao
+    grupo?: number;        // GRP_CODIGO
+    subgrupo?: number;     // SUBGRP_CODIGO
+    somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+  }): Promise<EstoqueSaidaRow[]> {
+    const { empresa } = params;
+
+    if (!/^\d+$/.test(empresa)) {
+      throw new BadRequestException('Empresa inválida');
+    }
+
+    // Normaliza/valida filtros numéricos. Trata ''/null/undefined/NaN como ausente
+    // (evita filtrar por 0 quando Number('') === 0).
+    const toInt = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.trunc(n) : undefined;
+    };
+    const codProduto = toInt(params.cod_produto);
+    const marca = toInt(params.marca);
+    const grupo = toInt(params.grupo);
+    const subgrupo = toInt(params.subgrupo);
+
+    // Descrição: remove aspas simples (evita quebra do literal Firebird) e normaliza.
+    const descricao = (params.descricao ?? '').replace(/'/g, '').trim().toUpperCase();
+
+    const temFiltro =
+      codProduto != null || marca != null || grupo != null || subgrupo != null || descricao.length > 0;
+    if (!temFiltro) {
+      throw new BadRequestException(
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição ou código) para a contagem avulsa.'
+      );
+    }
+
+    const where: string[] = [`WHERE PRO.empresa = '${empresa}'`];
+    if (codProduto != null) where.push(`AND PRO.pro_codigo = ${codProduto}`);
+    if (marca != null) where.push(`AND PRO.mar_codigo = ${marca}`);
+    if (grupo != null) where.push(`AND SG.grp_codigo = ${grupo}`);
+    if (subgrupo != null) where.push(`AND PRO.subgrp_codigo = ${subgrupo}`);
+    if (descricao.length > 0) where.push(`AND UPPER(PRO.pro_descricao) LIKE '%${descricao}%'`);
+    if (params.somente_com_saldo) {
+      where.push(`AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0`);
+    }
+
+    const innerSql = [
+      'SELECT',
+      '    CURRENT_DATE AS DATA,',
+      '    PRO.pro_codigo as COD_PRODUTO,',
+      '    PRO.pro_descricao AS DESC_PRODUTO,',
+      '    MC.mar_descricao,',
+      '    PRO.ref_fabricante,',
+      '    PRO.ref_FORNECEDOR,',
+      '    PRO.localizacao AS LOCALIZACAO,',
+      '    PRO.unidade,',
+      '    PRO.aplicacoes,',
+      '    PRO.codigo_barras,',
+      '    0 AS QTDE_SAIDA,',
+      '    PRO.estoque_disponivel AS ESTOQUE,',
+      '    PRO.estoque_reservado as RESERVA',
+      'FROM PRODUTOS PRO',
+      'JOIN MARCAS MC',
+      '    ON (MC.EMPRESA = PRO.EMPRESA)',
+      '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
+      'LEFT JOIN PRODUTOS_SUBGRUPOS SG',
+      '    ON (SG.EMPRESA = PRO.EMPRESA)',
+      '    AND (SG.SUBGRP_CODIGO = PRO.SUBGRP_CODIGO)',
+      'LEFT JOIN PRODUTOS_GRUPOS GR',
+      '    ON (GR.EMPRESA = SG.EMPRESA)',
+      '    AND (GR.GRP_CODIGO = SG.GRP_CODIGO)',
+      ...where,
+      'ORDER BY PRO.localizacao',
+    ].join('\n');
+
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const outerSql = `
+      /* contagem-avulsa produtos OPENQUERY */
+      SELECT *
+      FROM OPENQUERY(CONSULTA, '${innerEscaped}');
+    `;
+
+    const rows = await this.oq.query<EstoqueSaidaRow>(outerSql, {}, { timeout: 300_000 });
+    return this.explodeByLocation(rows);
+  }
+
+  /** Lista de grupos de produto (PRODUTOS_GRUPOS) para popular o filtro da avulsa. */
+  async fetchGrupos(empresa: string): Promise<Array<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    const innerSql = [
+      'SELECT GR.grp_codigo AS GRP_CODIGO, GR.grp_descricao AS GRP_DESCRICAO',
+      'FROM PRODUTOS_GRUPOS GR',
+      `WHERE GR.empresa = '${empresa}'`,
+      'ORDER BY GR.grp_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      GRP_CODIGO: Number((r as any).GRP_CODIGO),
+      GRP_DESCRICAO: this.toUtf8Text((r as any).GRP_DESCRICAO) ?? '',
+    }));
+  }
+
+  /** Lista de subgrupos (PRODUTOS_SUBGRUPOS), opcionalmente filtrada por grupo. */
+  async fetchSubgrupos(empresa: string, grupo?: number): Promise<Array<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    const grp = grupo != null && Number.isFinite(Number(grupo)) ? Math.trunc(Number(grupo)) : undefined;
+    const innerSql = [
+      'SELECT SG.subgrp_codigo AS SUBGRP_CODIGO, SG.subgrp_descricao AS SUBGRP_DESCRICAO, SG.grp_codigo AS GRP_CODIGO',
+      'FROM PRODUTOS_SUBGRUPOS SG',
+      `WHERE SG.empresa = '${empresa}'`,
+      ...(grp != null ? [`AND SG.grp_codigo = ${grp}`] : []),
+      'ORDER BY SG.subgrp_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      SUBGRP_CODIGO: Number((r as any).SUBGRP_CODIGO),
+      SUBGRP_DESCRICAO: this.toUtf8Text((r as any).SUBGRP_DESCRICAO) ?? '',
+      GRP_CODIGO: Number((r as any).GRP_CODIGO),
+    }));
+  }
+
+  /** Lista de marcas (MARCAS) para popular o filtro da avulsa. */
+  async fetchMarcas(empresa: string): Promise<Array<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    const innerSql = [
+      'SELECT MC.mar_codigo AS MAR_CODIGO, MC.mar_descricao AS MAR_DESCRICAO',
+      'FROM MARCAS MC',
+      `WHERE MC.empresa = '${empresa}'`,
+      'ORDER BY MC.mar_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      MAR_CODIGO: Number((r as any).MAR_CODIGO),
+      MAR_DESCRICAO: this.toUtf8Text((r as any).MAR_DESCRICAO) ?? '',
+    }));
+  }
+
   toUtf8Text(val: unknown): string | null {
     if (val == null) return null;                 // null/undefined
     if (typeof val === 'string') return val;      // já é string
@@ -295,7 +503,8 @@ export class EstoqueSaidasRepository {
       contagem: tipoContagem,
       produtos,
       contagem_cuid,
-      piso
+      piso,
+      tipo
     } = createContagemDto;
 
     // limpa possíveis NULs no nome
@@ -349,7 +558,7 @@ export class EstoqueSaidasRepository {
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
           piso: String(piso),
-          // tipo: createContagemDto.contagem || 1, // Salva o tipo (1=Diária, 2=Avulsa)
+          tipo: tipo ?? 1, // 1=Diária/Rotativa, 2=Avulsa
         },
         include: {
           usuario: {
