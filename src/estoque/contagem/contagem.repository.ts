@@ -557,7 +557,8 @@ export class EstoqueSaidasRepository {
           contagem_cuid: grupoContagem,
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
-          piso: String(piso),
+          // 'piso' guarda o NOME da contagem (para avulsa, já vem com prefixo "AVULSA - ").
+          piso: piso != null ? String(piso) : null,
           tipo: tipo ?? 1, // 1=Diária/Rotativa, 2=Avulsa
         },
         include: {
@@ -1243,7 +1244,8 @@ export class EstoqueSaidasRepository {
     };
 
     if (piso) {
-      whereClause.piso = piso;
+      // 'piso' guarda o nome da contagem; busca por parte do nome (case-insensitive).
+      whereClause.piso = { contains: piso, mode: 'insensitive' };
     }
 
     if (data) {
