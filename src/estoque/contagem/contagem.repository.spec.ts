@@ -151,6 +151,44 @@ describe('EstoqueSaidasRepository', () => {
       result.forEach((r) => expect(r.APLICACOES).toBeNull());
     });
 
+    it('deve reconhecer locações de Vitrine Móvel (VM202A01 / VM0202A01)', async () => {
+      const params = {
+        data_inicial: '2024-01-01',
+        data_final: '2024-01-31',
+        empresa: '3',
+      };
+
+      // VM tem prefixo de 2 letras. Deve ser extraída da LOCALIZACAO (mesmo misturada
+      // com um código padrão) e também das APLICACOES.
+      const mockSaidas = [
+        {
+          data: '2024-01-15',
+          COD_PRODUTO: 999,
+          DESC_PRODUTO: 'PRODUTO VITRINE MOVEL',
+          mar_descricao: 'MARCA',
+          ref_fabricante: 'REF1',
+          ref_FORNECEDOR: 'FORN1',
+          LOCALIZACAO: 'VM202A01 A1204E02',
+          unidade: 'UN',
+          APLICACOES: 'VM0202A01',
+          codigo_barras: null,
+          QTDE_SAIDA: 3,
+          ESTOQUE: 20,
+          RESERVA: 0,
+        },
+      ];
+
+      openQueryService.query.mockResolvedValue(mockSaidas);
+
+      const result = await repository.fetchSaidas(params);
+
+      const locs = result.map((r) => r.LOCALIZACAO);
+      expect(locs).toEqual(
+        expect.arrayContaining(['VM202A01', 'A1204E02', 'VM0202A01']),
+      );
+      expect(new Set(locs).size).toBe(3);
+    });
+
     it('deve deduplicar localizações repetidas entre LOCALIZACAO e APLICACOES', async () => {
       const params = {
         data_inicial: '2024-01-01',
@@ -670,10 +708,10 @@ describe('EstoqueSaidasRepository', () => {
 
       const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
 
-      // Primeira chamada: trava a contagem tipo 1
+      // Primeira chamada: trava a contagem tipo 1 e grava o fim (data_fim).
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(1, {
         where: { contagem_cuid, contagem: 1 },
-        data: { liberado_contagem: false },
+        data: { liberado_contagem: false, data_fim: expect.any(Date) },
       });
 
       // Segunda chamada: libera a contagem tipo 2

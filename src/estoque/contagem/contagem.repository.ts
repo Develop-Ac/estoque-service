@@ -68,10 +68,10 @@ function formatAndValidateLocation(text: string | null): string | null {
 
 
 
-  // 3. Regra do Padrão: Letra + 2-4 Números + Letra + 1-2 Números
-  // Ex: A1204E02, C16D1
-  // Regex: \b[A-Z]\d{2,4}[A-Z]\d{1,2}\b (Case insensitive)
-  const codeRegex = /\b[A-Z]\d{2,4}[A-Z]\d{1,2}\b/gi;
+  // 3. Regra do Padrão: 1-2 Letras + 2-4 Números + Letra + 1-2 Números
+  // Ex: A1204E02, C16D1 e Vitrine Móvel VM202A01 / VM0202A01 (prefixo de 2 letras).
+  // Regex: \b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b (Case insensitive)
+  const codeRegex = /\b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b/gi;
   const matches = text.match(codeRegex);
 
   if (matches && matches.length > 0) {
@@ -110,9 +110,10 @@ function extractLocations(text: string | null): string[] {
     return ['A-CX ESCADA'];
   }
 
-  // Padrão de código: Letra + 2-4 Números + Letra + 1-2 Números (ex.: A1204E02).
+  // Padrão de código: 1-2 Letras + 2-4 Números + Letra + 1-2 Números (ex.: A1204E02,
+  // e Vitrine Móvel VM202A01 / VM0202A01, cujo prefixo tem 2 letras).
   // Um mesmo campo pode conter VÁRIOS códigos -> cada um vira uma locação.
-  const codeRegex = /\b[A-Z]\d{2,4}[A-Z]\d{1,2}\b/gi;
+  const codeRegex = /\b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b/gi;
   const matches = text.match(codeRegex);
   if (matches && matches.length > 0) {
     return matches;
@@ -929,8 +930,12 @@ export class EstoqueSaidasRepository {
     contagem_cuid: string,
     contagem: number,
     divergencia: boolean,
-    itensParaRevalidar: string[] = []
+    itensParaRevalidar: string[] = [],
+    data_fim?: string
   ) {
+    // Fim da contagem = clique em "Concluir". Usa o horário do dispositivo quando válido.
+    let dataFim = data_fim ? new Date(data_fim) : new Date();
+    if (isNaN(dataFim.getTime())) dataFim = new Date();
     // 0. Revalidação Seletiva de Itens Falhos
     if (itensParaRevalidar && itensParaRevalidar.length > 0) {
       console.log(`[DEBUG] Revalidando ${itensParaRevalidar.length} itens que falharam anteriormente...`);
@@ -956,13 +961,13 @@ export class EstoqueSaidasRepository {
       }
     }
 
-    // Sempre trava a contagem atual (liberado_contagem = false)
+    // Sempre trava a contagem atual (liberado_contagem = false) e grava o fim.
     await this.prisma.est_contagem.updateMany({
       where: {
         contagem_cuid: contagem_cuid,
         contagem: contagem,
       },
-      data: { liberado_contagem: false },
+      data: { liberado_contagem: false, data_fim: dataFim },
     });
 
     // Se está na contagem 3, não há próxima para liberar
@@ -1493,6 +1498,37 @@ export class EstoqueSaidasRepository {
     });
   }
 
+  /**
+   * Grava o início da contagem (data_inicio) na PRIMEIRA quantidade contada.
+   * Regras:
+   *  - só grava se ainda estiver vazio; OU
+   *  - se o horário informado for MAIS ANTIGO que o já gravado (sync fora de ordem).
+   * Usa o horário real do dispositivo (client_time) quando válido; senão, now().
+   */
+  private async marcarInicioContagem(contagemId: string, clientTime?: string) {
+    try {
+      const contagem = await this.prisma.est_contagem.findUnique({
+        where: { id: contagemId },
+        select: { data_inicio: true },
+      });
+      if (!contagem) return;
+
+      let momento = clientTime ? new Date(clientTime) : new Date();
+      if (isNaN(momento.getTime())) momento = new Date();
+
+      const inicioAtual = contagem.data_inicio;
+      if (!inicioAtual || momento < inicioAtual) {
+        await this.prisma.est_contagem.update({
+          where: { id: contagemId },
+          data: { data_inicio: momento },
+        });
+      }
+    } catch (e) {
+      // Início é métrica auxiliar (para KPIs); nunca deve quebrar o registro do log.
+      console.error('[marcarInicioContagem] Falha ao gravar data_inicio', e);
+    }
+  }
+
   async createLog(createLogData: {
     contagem_id: string;
     usuario_id: string;
@@ -1500,7 +1536,14 @@ export class EstoqueSaidasRepository {
     estoque: number;
     contado: number;
     identificador_item?: string;
+    client_time?: string;
   }) {
+    // Marca o INÍCIO da contagem no momento da PRIMEIRA quantidade contada.
+    // Como o app é offline-first, usamos o horário REAL do dispositivo (client_time)
+    // — que pode ser bem anterior ao horário de sincronização. Só grava se ainda não
+    // houver início, ou se este log for mais antigo (sync fora de ordem).
+    await this.marcarInicioContagem(createLogData.contagem_id, createLogData.client_time);
+
     // 1. Tenta encontrar um log existente específico para este USUÁRIO nesta CONTAGEM e ITEM
     const existingLog = await this.prisma.est_contagem_log.findFirst({
       where: {

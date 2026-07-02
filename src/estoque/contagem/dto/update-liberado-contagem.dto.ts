@@ -35,4 +35,13 @@ export class UpdateLiberadoContagemDto {
   @IsOptional()
   @IsString({ each: true })
   itensParaRevalidar?: string[];
+
+  @ApiProperty({
+    description: 'Data/hora (ISO) em que o colaborador clicou em "Concluir". Grava o fim da contagem.',
+    example: '2025-11-10T14:05:00.000Z',
+    required: false
+  })
+  @IsOptional()
+  @IsString()
+  data_fim?: string;
 }

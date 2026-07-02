@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsNumber, IsString } from 'class-validator';
+import { IsNotEmpty, IsNumber, IsOptional, IsString } from 'class-validator';
 
 export class CreateLogDto {
   @ApiProperty({
@@ -39,4 +39,23 @@ export class CreateLogDto {
   })
   @IsNumber()
   contado!: number;
+
+  @ApiProperty({
+    description: 'Identificador de agrupamento do item (compartilhado entre localizações do mesmo produto/dia)',
+    example: '23251-2025-11-04',
+    required: false
+  })
+  @IsString()
+  @IsOptional()
+  identificador_item?: string;
+
+  @ApiProperty({
+    description:
+      'Data/hora (ISO) do momento REAL da contagem no dispositivo. Usada para gravar o início da contagem (offline-first). Se omitida, o backend usa a hora do recebimento.',
+    example: '2025-11-10T13:30:00.000Z',
+    required: false
+  })
+  @IsString()
+  @IsOptional()
+  client_time?: string;
 }
