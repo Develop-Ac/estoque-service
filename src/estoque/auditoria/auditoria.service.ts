@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EstoqueSaidasService } from '../contagem/contagem.service';
+import { consolidarProdutoDia } from '../contagem/consolidacao-produto';
 
 @Injectable()
 export class AuditoriaService {
@@ -67,6 +68,7 @@ export class AuditoriaService {
                 estoque: true,
                 contagem_cuid: true,
                 identificador_item: true,
+                data: true,
             },
         });
 
@@ -157,10 +159,17 @@ export class AuditoriaService {
                 }
             });
 
-            // Calcular saldo snapshot 
+            // CONSOLIDAÇÃO POR PRODUTO/DIA (todas as locações, de todas as sessões).
+            // É o que resolve o produto multilocação: a locação A pode ter fechado certo
+            // na 1ª contagem e a locação B só ter aparecido depois — a auditoria precisa
+            // enxergar a soma das locações, não cada sessão isoladamente.
+            const consolidado = await consolidarProdutoDia(this.prisma, cod_produto, firstItem.data);
+
+            // Calcular saldo snapshot
             // CORREÇÃO: O saldo 'estoque' em cada item já é o saldo TOTAL do sistema naquele momento.
             // Não devemos somar (pois duplicaria por locação), e sim pegar o de referência (primeiro).
-            const estoqueSnapshot = groupItems.length > 0 ? groupItems[0].estoque : 0;
+            const estoqueSnapshot = consolidado?.estoque_referencia
+                ?? (groupItems.length > 0 ? groupItems[0].estoque : 0);
 
             // Estoque Atual Real do Sistema
             const estoqueAtualInfo = await this.contagemService.getEstoqueProduto(cod_produto);
@@ -172,8 +181,14 @@ export class AuditoriaService {
                 3: history[3].total - estoqueSnapshot,
             };
 
-            // AUTO-AUDITORIA: Se a 3ª contagem bateu (diferença 0), auditoria automática.
-            if (diferencas[3] === 0 && !audetado && mainCuid && systemUser) {
+            // AUTO-AUDITORIA: o produto é dado como correto quando QUALQUER etapa fechou —
+            // uma rodada inteira somando todas as locações, ou a última contagem de cada
+            // locação (mesmo que cada uma tenha acertado numa rodada diferente).
+            const motivoCorreto = consolidado?.correto
+                ? consolidado.motivo
+                : (diferencas[3] === 0 ? 'Terceira contagem correta' : null);
+
+            if (motivoCorreto && !audetado && mainCuid && systemUser) {
                 // Criar auditoria automática
                 const autoAudit = await this.prisma.est_auditoria.create({
                     data: {
@@ -182,7 +197,7 @@ export class AuditoriaService {
                         diferenca_apontada: 0,
                         tipo_movimento: 'CORRETO',
                         quantidade_movimento: 0,
-                        observacao: "Terceira contagem correta",
+                        observacao: motivoCorreto,
                         usuario_id: systemUser.id,
                         status: 1
                     }
@@ -210,6 +225,23 @@ export class AuditoriaService {
                 piso: piso,
                 history,
                 diferencas,
+                // Visão consolidada das locações (inclusive as de outras sessões/pisos):
+                // permite o front explicar por que o produto foi dado como correto.
+                consolidado: consolidado ? {
+                    correto: consolidado.correto,
+                    motivo: consolidado.motivo,
+                    estoque_referencia: consolidado.estoque_referencia,
+                    total_ultima_contagem: consolidado.total_ultima_contagem,
+                    todas_locacoes_contadas: consolidado.todas_locacoes_contadas,
+                    locacoes: consolidado.locacoes.map(l => ({
+                        localizacao: l.localizacao,
+                        contagem_cuid: l.contagem_cuid,
+                        por_rodada: l.por_rodada,
+                        ultima_rodada: l.ultima_rodada,
+                        ultima_qtd: l.ultima_qtd,
+                    })),
+                    rodadas: consolidado.rodadas,
+                } : null,
                 ja_auditado: !!audetado,
                 audit_id: audetado?.id,
                 audit_dados: audetado ? {

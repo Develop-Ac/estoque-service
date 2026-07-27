@@ -685,10 +685,79 @@ describe('EstoqueSaidasRepository', () => {
   });
 
   describe('updateLiberadoContagem', () => {
+    const DATA_ITEM = new Date('2024-01-15T00:00:00Z');
+
+    /**
+     * A conclusão de uma rodada passou a reavaliar cada produto olhando TODAS as suas
+     * locações (inclusive as que estão em outra sessão/piso). Este helper monta os mocks
+     * do Prisma respondendo de acordo com a consulta feita.
+     */
+    function configurarCenario(opts: {
+      itensDaSessao: Array<{ id: string; cod_produto: number; data?: Date }>;
+      itensDoProduto: Array<{
+        id: string;
+        contagem_cuid: string;
+        localizacao?: string;
+        identificador_item?: string;
+        estoque: number;
+      }>;
+      cuidsAtivos: string[];
+      logs: Array<{ item_id: string; contado: number; rodada: number; estoque: number }>;
+      proximaContagem?: Array<{ id: string }>;
+      rodadasLiberadas?: Array<{ id: string; contagem: number; logs: number }>;
+      itensPendentes?: number;
+      retornoFindFirst?: any;
+    }) {
+      mockPrismaService.est_contagem_itens.findMany.mockImplementation((args: any) =>
+        Promise.resolve(
+          args?.select?.estoque
+            ? opts.itensDoProduto.map(i => ({
+              localizacao: null,
+              identificador_item: null,
+              ...i,
+            }))
+            : opts.itensDaSessao.map(i => ({ data: DATA_ITEM, ...i })),
+        ),
+      );
+
+      mockPrismaService.est_contagem.findMany.mockImplementation((args: any) => {
+        if (args?.where?.status === 0 && args?.select?.contagem_cuid) {
+          return Promise.resolve(opts.cuidsAtivos.map(c => ({ contagem_cuid: c })));
+        }
+        if (args?.where?.contagem?.gt === 1) {
+          return Promise.resolve(
+            (opts.rodadasLiberadas ?? []).map(r => ({
+              id: r.id,
+              contagem: r.contagem,
+              _count: { logs: r.logs },
+            })),
+          );
+        }
+        return Promise.resolve(opts.proximaContagem ?? []);
+      });
+
+      mockPrismaService.est_contagem_log.findMany.mockResolvedValue(
+        opts.logs.map(l => ({
+          item_id: l.item_id,
+          contado: l.contado,
+          estoque: l.estoque,
+          contagem: { contagem: l.rodada, status: 0 },
+        })),
+      );
+
+      mockPrismaService.est_contagem_itens.count.mockResolvedValue(opts.itensPendentes ?? 0);
+      mockPrismaService.est_contagem_itens.updateMany.mockResolvedValue({ count: 1 });
+      mockPrismaService.est_contagem.updateMany.mockResolvedValue({ count: 1 });
+      mockPrismaService.est_contagem.findFirst.mockResolvedValue(opts.retornoFindFirst ?? null);
+    }
+
+    const chamadasLiberando = () =>
+      mockPrismaService.est_contagem.updateMany.mock.calls.filter(
+        ([arg]: any[]) => arg?.data?.liberado_contagem === true,
+      );
+
     it('deve liberar contagem tipo 2 quando há divergência na contagem tipo 1', async () => {
       const contagem_cuid = 'grupo-123';
-      const contagem = 1;
-      const divergencia = true; // divergência confirmada pelo front
 
       const mockContagemLiberada = {
         id: 'contagem-456',
@@ -699,14 +768,16 @@ describe('EstoqueSaidasRepository', () => {
         created_at: new Date('2024-01-15T10:00:00Z'),
       };
 
-      mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 }) // trava a contagem atual
-        .mockResolvedValueOnce({ count: 1 }); // libera a próxima
-      // Há contagem tipo 2 para liberar
-      mockPrismaService.est_contagem.findMany.mockResolvedValue([{ id: 'contagem-456' }]);
-      mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemLiberada);
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-1', cod_produto: 12345 }],
+        itensDoProduto: [{ id: 'item-1', contagem_cuid, estoque: 100 }],
+        cuidsAtivos: [contagem_cuid],
+        logs: [{ item_id: 'item-1', contado: 90, rodada: 1, estoque: 100 }],
+        proximaContagem: [{ id: 'contagem-456' }],
+        retornoFindFirst: mockContagemLiberada,
+      });
 
-      const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+      const result = await repository.updateLiberadoContagem(contagem_cuid, 1, true);
 
       // Primeira chamada: trava a contagem tipo 1 e grava o fim (data_fim).
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(1, {
@@ -714,10 +785,15 @@ describe('EstoqueSaidasRepository', () => {
         data: { liberado_contagem: false, data_fim: expect.any(Date) },
       });
 
-      // Segunda chamada: libera a contagem tipo 2
+      // A divergência real (90 contados x 100 de estoque) libera a contagem tipo 2.
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(2, {
         where: { contagem_cuid, contagem: 2 },
         data: { liberado_contagem: true },
+      });
+
+      expect(mockPrismaService.est_contagem_itens.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['item-1'] } },
+        data: { conferir: true },
       });
 
       expect(result).toEqual(mockContagemLiberada);
@@ -725,8 +801,6 @@ describe('EstoqueSaidasRepository', () => {
 
     it('deve liberar contagem tipo 3 quando há divergência na contagem tipo 2', async () => {
       const contagem_cuid = 'grupo-123';
-      const contagem = 2;
-      const divergencia = true;
 
       const mockContagemLiberada = {
         id: 'contagem-789',
@@ -737,13 +811,19 @@ describe('EstoqueSaidasRepository', () => {
         created_at: new Date('2024-01-15T10:00:00Z'),
       };
 
-      mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 })
-        .mockResolvedValueOnce({ count: 1 });
-      mockPrismaService.est_contagem.findMany.mockResolvedValue([{ id: 'contagem-789' }]);
-      mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemLiberada);
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-1', cod_produto: 12345 }],
+        itensDoProduto: [{ id: 'item-1', contagem_cuid, estoque: 100 }],
+        cuidsAtivos: [contagem_cuid],
+        logs: [
+          { item_id: 'item-1', contado: 90, rodada: 1, estoque: 100 },
+          { item_id: 'item-1', contado: 95, rodada: 2, estoque: 100 },
+        ],
+        proximaContagem: [{ id: 'contagem-789' }],
+        retornoFindFirst: mockContagemLiberada,
+      });
 
-      const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+      const result = await repository.updateLiberadoContagem(contagem_cuid, 2, true);
 
       expect(mockPrismaService.est_contagem.updateMany).toHaveBeenNthCalledWith(2, {
         where: { contagem_cuid, contagem: 3 },
@@ -755,26 +835,22 @@ describe('EstoqueSaidasRepository', () => {
 
     it('não deve liberar próxima contagem na contagem tipo 3 (última)', async () => {
       const contagem_cuid = 'grupo-123';
-      const contagem = 3;
-      const divergencia = true;
 
-      mockPrismaService.est_contagem.updateMany
-        .mockResolvedValueOnce({ count: 1 }) // trava atual
-        .mockResolvedValueOnce({ count: 1 }); // retorno antecipado (sem próxima)
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-1', cod_produto: 12345 }],
+        itensDoProduto: [{ id: 'item-1', contagem_cuid, estoque: 100 }],
+        cuidsAtivos: [contagem_cuid],
+        logs: [{ item_id: 'item-1', contado: 90, rodada: 3, estoque: 100 }],
+      });
 
-      await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+      await repository.updateLiberadoContagem(contagem_cuid, 3, true);
 
       // Na contagem 3 não existe "próxima" para liberar com liberado_contagem: true
-      const chamadasLiberando = mockPrismaService.est_contagem.updateMany.mock.calls.filter(
-        ([arg]) => arg?.data?.liberado_contagem === true,
-      );
-      expect(chamadasLiberando).toHaveLength(0);
+      expect(chamadasLiberando()).toHaveLength(0);
     });
 
     it('não deve liberar próxima contagem quando não há divergência', async () => {
       const contagem_cuid = 'grupo-123';
-      const contagem = 1;
-      const divergencia = false;
 
       const mockContagemAtual = {
         id: 'contagem-123',
@@ -783,18 +859,138 @@ describe('EstoqueSaidasRepository', () => {
         liberado_contagem: false,
       };
 
-      mockPrismaService.est_contagem.updateMany.mockResolvedValue({ count: 1 });
-      // Sem itens => não há como calcular divergência => nada é liberado
-      mockPrismaService.est_contagem_itens.findMany.mockResolvedValue([]);
-      mockPrismaService.est_contagem.findFirst.mockResolvedValue(mockContagemAtual);
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-1', cod_produto: 12345 }],
+        itensDoProduto: [{ id: 'item-1', contagem_cuid, estoque: 100 }],
+        cuidsAtivos: [contagem_cuid],
+        logs: [{ item_id: 'item-1', contado: 100, rodada: 1, estoque: 100 }],
+        retornoFindFirst: mockContagemAtual,
+      });
 
-      const result = await repository.updateLiberadoContagem(contagem_cuid, contagem, divergencia);
+      const result = await repository.updateLiberadoContagem(contagem_cuid, 1, false);
 
-      const chamadasLiberando = mockPrismaService.est_contagem.updateMany.mock.calls.filter(
-        ([arg]) => arg?.data?.liberado_contagem === true,
-      );
-      expect(chamadasLiberando).toHaveLength(0);
+      expect(chamadasLiberando()).toHaveLength(0);
       expect(result).toEqual(mockContagemAtual);
+    });
+
+    it('não libera nada quando a locação da OUTRA sessão já fechou o produto, mesmo com o front acusando divergência', async () => {
+      // Sessão da vitrine (VM601B02) conta 0 e, sozinha, não fecha com o estoque 18.
+      // Mas a locação C1306B02, contada na sessão do corredor, já fechou os 18.
+      const contagem_cuid = 'sessao-vitrine';
+
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-vm', cod_produto: 38677 }],
+        itensDoProduto: [
+          { id: 'item-c13', contagem_cuid: 'sessao-corredor', estoque: 18 },
+          { id: 'item-vm', contagem_cuid, estoque: 18 },
+        ],
+        cuidsAtivos: ['sessao-corredor', contagem_cuid],
+        logs: [
+          { item_id: 'item-c13', contado: 18, rodada: 1, estoque: 18 },
+          { item_id: 'item-vm', contado: 0, rodada: 1, estoque: 18 },
+        ],
+        retornoFindFirst: { id: 'contagem-vm-1', contagem: 1, liberado_contagem: false },
+      });
+
+      await repository.updateLiberadoContagem(contagem_cuid, 1, true);
+
+      expect(chamadasLiberando()).toHaveLength(0);
+
+      // As DUAS locações saem do funil, não só a desta sessão.
+      expect(mockPrismaService.est_contagem_itens.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['item-c13', 'item-vm'] } },
+        data: { conferir: false },
+      });
+    });
+
+    it('segue para a próxima contagem quando a outra locação ainda NÃO foi contada (não trava esperando)', async () => {
+      // A vitrine concluiu a 1ª contagem antes de o corredor contar a outra locação.
+      // Sem o total não dá para dizer que fechou -> a sessão segue para a 2ª contagem.
+      // (Se o corredor fechar o produto depois, essa 2ª contagem é revogada — teste abaixo.)
+      const contagem_cuid = 'sessao-vitrine';
+
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-vm', cod_produto: 38677 }],
+        itensDoProduto: [
+          { id: 'item-c13', contagem_cuid: 'sessao-corredor', estoque: 18 },
+          { id: 'item-vm', contagem_cuid, estoque: 18 },
+        ],
+        cuidsAtivos: ['sessao-corredor', contagem_cuid],
+        logs: [{ item_id: 'item-vm', contado: 0, rodada: 1, estoque: 18 }],
+        proximaContagem: [{ id: 'contagem-vm-2' }],
+        retornoFindFirst: { id: 'contagem-vm-2', contagem: 2, liberado_contagem: true },
+      });
+
+      await repository.updateLiberadoContagem(contagem_cuid, 1, true);
+
+      expect(mockPrismaService.est_contagem.updateMany).toHaveBeenCalledWith({
+        where: { contagem_cuid, contagem: 2 },
+        data: { liberado_contagem: true },
+      });
+
+      // E só as locações DESTA sessão são marcadas para recontagem.
+      expect(mockPrismaService.est_contagem_itens.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['item-vm'] } },
+        data: { conferir: true },
+      });
+    });
+
+    it('revoga a rodada que a outra sessão havia liberado quando o produto fecha depois', async () => {
+      // A sessão da vitrine concluiu antes e foi liberada para a 2ª contagem. Agora a
+      // sessão do corredor conta a outra locação e o produto fecha: a 2ª contagem da
+      // vitrine, ainda não iniciada, é fechada de volta.
+      const contagem_cuid = 'sessao-corredor';
+
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-c13', cod_produto: 38677 }],
+        itensDoProduto: [
+          { id: 'item-c13', contagem_cuid, estoque: 18 },
+          { id: 'item-vm', contagem_cuid: 'sessao-vitrine', estoque: 18 },
+        ],
+        cuidsAtivos: [contagem_cuid, 'sessao-vitrine'],
+        logs: [
+          { item_id: 'item-c13', contado: 18, rodada: 1, estoque: 18 },
+          { item_id: 'item-vm', contado: 0, rodada: 1, estoque: 18 },
+        ],
+        rodadasLiberadas: [{ id: 'contagem-vm-2', contagem: 2, logs: 0 }],
+        itensPendentes: 0,
+        retornoFindFirst: { id: 'contagem-c13-1', contagem: 1, liberado_contagem: false },
+      });
+
+      await repository.updateLiberadoContagem(contagem_cuid, 1, false);
+
+      expect(chamadasLiberando()).toHaveLength(0);
+      expect(mockPrismaService.est_contagem.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['contagem-vm-2'] } },
+        data: { liberado_contagem: false },
+      });
+    });
+
+    it('não revoga rodada da outra sessão que já foi iniciada nem quando ela ainda tem itens pendentes', async () => {
+      const contagem_cuid = 'sessao-corredor';
+
+      configurarCenario({
+        itensDaSessao: [{ id: 'item-c13', cod_produto: 38677 }],
+        itensDoProduto: [
+          { id: 'item-c13', contagem_cuid, estoque: 18 },
+          { id: 'item-vm', contagem_cuid: 'sessao-vitrine', estoque: 18 },
+        ],
+        cuidsAtivos: [contagem_cuid, 'sessao-vitrine'],
+        logs: [
+          { item_id: 'item-c13', contado: 18, rodada: 1, estoque: 18 },
+          { item_id: 'item-vm', contado: 0, rodada: 1, estoque: 18 },
+        ],
+        // A 2ª contagem da vitrine já tem logs -> trabalho em andamento, não se mexe.
+        rodadasLiberadas: [{ id: 'contagem-vm-2', contagem: 2, logs: 3 }],
+        retornoFindFirst: { id: 'contagem-c13-1', contagem: 1, liberado_contagem: false },
+      });
+
+      await repository.updateLiberadoContagem(contagem_cuid, 1, false);
+
+      const revogacoes = mockPrismaService.est_contagem.updateMany.mock.calls.filter(
+        ([arg]: any[]) => arg?.where?.id?.in && arg?.data?.liberado_contagem === false,
+      );
+      expect(revogacoes).toHaveLength(0);
     });
   });
 

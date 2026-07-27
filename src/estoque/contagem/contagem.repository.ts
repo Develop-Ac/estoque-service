@@ -6,6 +6,7 @@ import { CreateContagemDto } from './dto/create-contagem.dto';
 import { ConferirEstoqueResponseDto } from './dto/conferir-estoque-response.dto';
 import { Prisma } from '@prisma/client';
 import crypto from 'crypto';
+import { consolidarProdutoDia, ConsolidadoProdutoDia, Rodada } from './consolidacao-produto';
 
 // ==== helpers de saneamento (anti-NUL) ====
 function stripNulls(s: string): string {
@@ -830,62 +831,117 @@ export class EstoqueSaidasRepository {
     console.log(`[DEBUG] updateItemConferir: Divergencia Final? ${temDivergenciaNumerica} (RealSum=${realSum} vs EstoqueRef=${estoqueRealtime})`);
 
     // Se o usuário mandou "conferir: false", mas matematicamente tem divergência,
-    // precisamos ter cuidado. 
+    // precisamos ter cuidado.
     // O sistema original forçava o Back a decidir.
 
     // --- LÓGICA DE VALIDAÇÃO HÍBRIDA (FRONT x BACK) ---
-    // 1. Buscar todos os itens que compõem este produto (mesmo identificador)
-    const groupItems = await this.prisma.est_contagem_itens.findMany({
-      where: {
-        identificador_item: identificador_item,
-        contagem_cuid: parentContagem?.contagem_cuid ?? ''
-      }
-    });
+    // O produto pode ter locações espalhadas por SESSÕES diferentes (pisos/CUIDs
+    // distintos, portanto identificador_item distinto). Por isso a validação olha o
+    // produto/dia inteiro — só assim "locação A certa + locação B certa" fecha com o
+    // estoque total do sistema.
+    const consolidado = await consolidarProdutoDia(
+      this.prisma,
+      contagemItem.cod_produto,
+      contagemItem.data,
+      { estoqueReferencia: estoqueRealtime },
+    );
+
+    const rodadaAtual = parentContagem?.contagem;
+    const totalLocacoes = consolidado?.locacoes.length ?? 1;
 
     let finalConferirValue = temDivergenciaNumerica; // Default: Back decide (segurança)
-    let trustFront = false;
+    let escopoUpdate: Prisma.est_contagem_itensWhereInput = { identificador_item: identificador_item };
 
-    if (groupItems.length <= 1) {
+    if (totalLocacoes <= 1) {
       // CASO 1: Locação Única -> CONFIA NO FRONT
       // O usuário sabe o que está vendo. Se ele marcou que tem divergência, tem. Se não, não.
-      trustFront = true;
-    } else {
-      // CASO 2: Multilocação
-      // Verificamos se TODOS os locais já foram contados nesta rodada.
-      // Se ainda falta contagem em algum local, não temos como validar o total,
-      // então confiamos no status provisório que o front mandar.
-
-      const countedItemIds = new Set(logsRelevantes.map(l => l.item_id));
-      const allLocationsCounted = groupItems.every(item => countedItemIds.has(item.id));
-
-      if (!allLocationsCounted) {
-        // Ainda não acabou de contar todos os locais -> CONFIA NO FRONT (Status Provisório)
-        trustFront = true;
-      } else {
-        // Todos contados -> VALIDAÇÃO RIGOROSA DO BACK
-        // Somamos tudo e vemos se bate com o estoque total.
-        trustFront = false;
-      }
-    }
-
-    if (trustFront) {
       console.log(`[DEBUG] HybridValidation: Trusting Frontend value=${conferir}`);
       finalConferirValue = conferir;
+    } else if (consolidado?.correto) {
+      // CASO 2: Multilocação já fechada com o estoque (nesta rodada ou somando a última
+      // contagem de cada locação) -> NENHUMA locação segue para as próximas contagens,
+      // inclusive as que estão em outras sessões.
+      console.log(`[DEBUG] HybridValidation: Produto fechado -> ${consolidado.motivo}`);
+      finalConferirValue = false;
+      escopoUpdate = { id: { in: consolidado.itens_ids } };
+    } else if (consolidado && rodadaAtual && this.rodadaCoberta(consolidado, rodadaAtual)) {
+      // CASO 3: Multilocação com TODAS as locações já contadas nesta rodada e a soma não
+      // fechou -> divergência confirmada pelo BACK.
+      console.log(`[DEBUG] HybridValidation: Enforcing Backend value=true (soma ${consolidado.rodadas[rodadaAtual as Rodada].total} x estoque ${consolidado.estoque_referencia})`);
+      finalConferirValue = true;
     } else {
-      console.log(`[DEBUG] HybridValidation: Enforcing Backend value=${temDivergenciaNumerica}`);
-      finalConferirValue = temDivergenciaNumerica;
+      // CASO 4: Ainda falta contar alguma locação (possivelmente em outra sessão).
+      // Sem o total não dá para validar -> CONFIA NO FRONT (status provisório).
+      console.log(`[DEBUG] HybridValidation: Locações pendentes, trusting Frontend value=${conferir}`);
+      finalConferirValue = conferir;
     }
 
     // ATUALIZAÇÃO EM MASSA:
     const updated = await this.prisma.est_contagem_itens.updateMany({
-      where: { identificador_item: identificador_item },
+      where: escopoUpdate,
       data: { conferir: finalConferirValue },
     });
+
+    // Se o produto fechou, as outras sessões que já haviam sido liberadas para a 2ª/3ª
+    // contagem por causa dele não têm mais o que recontar.
+    if (consolidado?.correto) {
+      for (const cuidIrmao of consolidado.cuids) {
+        if (cuidIrmao === parentContagem?.contagem_cuid) continue;
+        await this.revogarLiberacoesSemDivergencia(cuidIrmao);
+      }
+    }
 
     // Retorna um dos itens atualizados
     return await this.prisma.est_contagem_itens.findFirst({
       where: { id: itemId }
     });
+  }
+
+  /** true quando TODAS as locações do produto/dia foram contadas na rodada informada. */
+  private rodadaCoberta(consolidado: ConsolidadoProdutoDia, rodada: number): boolean {
+    if (rodada !== 1 && rodada !== 2 && rodada !== 3) return false;
+    return consolidado.rodadas[rodada as Rodada].cobertura_total;
+  }
+
+  /**
+   * "Chama de volta" as contagens 2/3 de uma sessão que foram liberadas por engano.
+   *
+   * Cenário: a sessão A concluiu ANTES de a sessão B contar a outra locação do mesmo
+   * produto. Somando só a locação de A a conta não fechava, então A foi liberada para a
+   * 2ª contagem. Quando B conta a outra locação e o produto fecha com o estoque, A não
+   * tem mais nada para recontar.
+   *
+   * Só revoga rodadas que ainda NÃO foram iniciadas (sem nenhum log) e nunca a 1ª
+   * contagem — trabalho já feito não é desfeito.
+   */
+  private async revogarLiberacoesSemDivergencia(contagem_cuid: string) {
+    if (!contagem_cuid) return;
+
+    const pendentes = await this.prisma.est_contagem_itens.count({
+      where: { contagem_cuid: contagem_cuid, conferir: true },
+    });
+
+    if (pendentes > 0) return;
+
+    const rodadasLiberadas = await this.prisma.est_contagem.findMany({
+      where: {
+        contagem_cuid: contagem_cuid,
+        contagem: { gt: 1 },
+        liberado_contagem: true,
+        status: 0,
+      },
+      select: { id: true, contagem: true, _count: { select: { logs: true } } },
+    });
+
+    const idsSemLogs = rodadasLiberadas.filter(r => r._count.logs === 0).map(r => r.id);
+    if (idsSemLogs.length === 0) return;
+
+    await this.prisma.est_contagem.updateMany({
+      where: { id: { in: idsSemLogs } },
+      data: { liberado_contagem: false },
+    });
+
+    console.log(`[DEBUG] revogarLiberacoes: CUID=${contagem_cuid} -> ${idsSemLogs.length} rodada(s) fechada(s) por não haver mais divergência.`);
   }
 
   async getEstoqueProduto(codProduto: number, empresa: string = '3'): Promise<ConferirEstoqueResponseDto | null> {
@@ -972,6 +1028,7 @@ export class EstoqueSaidasRepository {
 
     // Se está na contagem 3, não há próxima para liberar
     if (contagem === 3) {
+      await this.reconciliarProdutosDaSessao(contagem_cuid);
       return await this.prisma.est_contagem.updateMany({
         where: {
           contagem_cuid: contagem_cuid,
@@ -981,98 +1038,14 @@ export class EstoqueSaidasRepository {
       });
     }
 
-    // Se divergência já for TRUE pelo frontend, segue normal.
-    // Mas se for FALSE, precisamos verificar se não há "falsos positivos" (itens pendentes marcados como verdes)
-    let temDivergenciaReal = divergencia;
+    // VALIDAÇÃO CONSOLIDADA (produto/dia, todas as locações de todas as sessões).
+    // O flag `divergencia` que vem do front enxerga apenas as locações desta sessão. Se o
+    // mesmo produto está em outro piso/sessão, essa visão é parcial nos dois sentidos:
+    //  - pode acusar divergência que a outra locação já resolveu (aí NÃO se libera nada);
+    //  - pode dar tudo certo aqui e faltar locação lá (aí a divergência continua valendo).
+    const { algumProdutoDivergente, temItens } = await this.reconciliarProdutosDaSessao(contagem_cuid);
 
-    if (!temDivergenciaReal) {
-      // Buscar itens para conferir se a soma bate
-      // Busca itens da contagem atual
-      // Precisamos dos LOGS também para somar
-      // Isso pode ser pesado, mas necessário para segurança.
-      const itens = await this.prisma.est_contagem_itens.findMany({
-        where: { contagem_cuid: contagem_cuid },
-      });
-
-      // Agrupar itens por código de produto
-      const itemsByProduct: Record<string, typeof itens> = {};
-      for (const item of itens) {
-        const key = String(item.cod_produto);
-        if (!itemsByProduct[key]) itemsByProduct[key] = [];
-        itemsByProduct[key].push(item);
-      }
-
-      // Iterar por CÓDIGO DE PRODUTO (Agrupamento)
-      for (const codProduto in itemsByProduct) {
-        const groupItems = itemsByProduct[codProduto];
-
-        // Se houver apenas 1 item e não tiver aplicação, segue lógica padrão individual
-        // Mas para garantir consistência, vamos usar a lógica de soma para tudo.
-
-        // 1. Calcular o Estoque de Referência
-        // Como agora o updateItemConferir ATUALIZA o campo estoque com o valor da OpenQuery no momento do salvo,
-        // podemos confiar no valor do banco, sem precisar fazer fetch de novo aqui.
-        // Isso atende o requisito: "a busca deve ser feita sempre que for clicado em salvar no item no front"
-        const estoqueRef = groupItems[0].estoque || 0;
-
-        // 2. Calcular a Soma Total Contada para este Produto (somando logs de todos os itens do grupo)
-        let grandTotalContado = 0;
-
-        // Precisamos dos IDs de contagem para filtrar logs (Ajuste anterior: contagemIds)
-        const contagemRows = await this.prisma.est_contagem.findMany({
-          where: { contagem_cuid: contagem_cuid, contagem: contagem },
-          select: { id: true }
-        });
-        const contagemIds = contagemRows.map(c => c.id);
-
-        if (contagemIds.length > 0) {
-          for (const item of groupItems) {
-            // Buscar logs para este item
-            const logs = await this.prisma.est_contagem_log.findMany({
-              where: { identificador_item: item.identificador_item }, // Logs são por item
-            });
-
-            // Filtrar logs apenas da contagem atual (Ids encontrados)
-            const activeLogs = logs.filter(l => contagemIds.includes(l.contagem_id));
-
-            // Soma simples dos logs deste item
-            // FIX: Evita somar logs duplicados caso itemsByProduct tenha mais de 1 item (locações diferentes)
-            // mas que apontam para o mesmo identificador_item.
-            // Como estamos iterando por GROUP ITEMS, se tivermos 2 itens com mesmo identificador,
-            // vamos processar 2 vezes.
-            // A solução é iterar por "Identificador Item Único" dentro do grupo de produtos.
-            const uniqueIdentifiers = [...new Set(groupItems.map(i => i.identificador_item).filter(id => id !== null))];
-
-            grandTotalContado = 0; // Reinicia para calcular corretamente baseados nos unicos
-
-            for (const idIdentificador of uniqueIdentifiers) {
-              const logs = await this.prisma.est_contagem_log.findMany({
-                where: { identificador_item: idIdentificador },
-              });
-              // Filtra logs apenas da contagem atual
-              const activeLogs = logs.filter(l => contagemIds.includes(l.contagem_id));
-              const partSum = activeLogs.reduce((acc, log) => acc + log.contado, 0);
-              grandTotalContado += partSum;
-            }
-
-            // Break loop para não repetir soma para cada item do grupo, já calculamos o total do PRODUTO.
-            break;
-          }
-
-          // 3. Comparar Soma Total x Estoque Total
-          if (grandTotalContado !== estoqueRef) {
-            temDivergenciaReal = true;
-
-            // ATUALIZAR TODOS OS ITENS DO GRUPO
-            const itemIds = groupItems.map(i => i.id);
-            await this.prisma.est_contagem_itens.updateMany({
-              where: { id: { in: itemIds } },
-              data: { conferir: true }
-            });
-          }
-        }
-      }
-    }
+    const temDivergenciaReal = temItens ? algumProdutoDivergente : divergencia;
 
     if (temDivergenciaReal) {
       console.log(`[DEBUG] updateLiberadoContagem: CUID=${contagem_cuid}, Contagem=${contagem} (${typeof contagem}), Divergencia=${divergencia}`);
@@ -1127,13 +1100,82 @@ export class EstoqueSaidasRepository {
       return contagemAtualizada;
     }
 
-    // Se não há divergência, só trava o atual e não libera o próximo
+    // Se não há divergência, só trava o atual e não libera o próximo.
+    // Se alguma rodada seguinte tinha sido liberada antes (por uma conclusão anterior que
+    // ainda não enxergava a outra locação), ela é fechada aqui.
+    await this.revogarLiberacoesSemDivergencia(contagem_cuid);
+
     return await this.prisma.est_contagem.findFirst({
       where: {
         contagem_cuid: contagem_cuid,
         contagem: contagem,
       },
     });
+  }
+
+  /**
+   * Reavalia todos os produtos de uma sessão olhando o produto/dia INTEIRO — todas as
+   * locações, inclusive as que estão em outras sessões (outro piso, outro CUID).
+   *
+   * - Produto que fechou com o estoque: `conferir = false` em TODAS as locações (as desta
+   *   sessão e as das outras), e as rodadas que as outras sessões tinham aberto por causa
+   *   dele são fechadas se ainda não foram iniciadas.
+   * - Produto que não fechou: `conferir = true` nas locações desta sessão, que segue para
+   *   a próxima contagem.
+   */
+  private async reconciliarProdutosDaSessao(
+    contagem_cuid: string,
+  ): Promise<{ algumProdutoDivergente: boolean; temItens: boolean }> {
+    const itens = await this.prisma.est_contagem_itens.findMany({
+      where: { contagem_cuid: contagem_cuid },
+      select: { id: true, cod_produto: true, data: true },
+    });
+
+    if (itens.length === 0) {
+      return { algumProdutoDivergente: false, temItens: false };
+    }
+
+    // Agrupa as locações desta sessão por produto/dia (a chave usada na consolidação).
+    const grupos = new Map<string, { cod_produto: number; data: Date; itensIds: string[] }>();
+    for (const item of itens) {
+      const chave = `${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`;
+      const grupo = grupos.get(chave);
+      if (grupo) grupo.itensIds.push(item.id);
+      else grupos.set(chave, { cod_produto: item.cod_produto, data: item.data, itensIds: [item.id] });
+    }
+
+    let algumProdutoDivergente = false;
+    const cuidsIrmaos = new Set<string>();
+
+    for (const grupo of grupos.values()) {
+      const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data);
+      if (!consolidado) continue;
+
+      if (consolidado.correto) {
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: consolidado.itens_ids } },
+          data: { conferir: false },
+        });
+
+        for (const cuid of consolidado.cuids) {
+          if (cuid !== contagem_cuid) cuidsIrmaos.add(cuid);
+        }
+
+        console.log(`[DEBUG] reconciliar: produto ${grupo.cod_produto} OK -> ${consolidado.motivo}`);
+      } else {
+        algumProdutoDivergente = true;
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: grupo.itensIds } },
+          data: { conferir: true },
+        });
+      }
+    }
+
+    for (const cuidIrmao of cuidsIrmaos) {
+      await this.revogarLiberacoesSemDivergencia(cuidIrmao);
+    }
+
+    return { algumProdutoDivergente, temItens: true };
   }
 
   async getContagensByGrupo(contagem_cuid: string) {
