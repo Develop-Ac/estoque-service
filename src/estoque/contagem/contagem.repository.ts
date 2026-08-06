@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { OpenQueryService } from '../../shared/database/openquery/openquery.service';
+import { ErpApiService } from '../../shared/erp-api/erp-api.service';
 import { EstoqueSaidaRow } from './contagem.types';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateContagemDto } from './dto/create-contagem.dto';
@@ -132,10 +133,58 @@ function extractLocations(text: string | null): string[] {
 export class EstoqueSaidasRepository {
   constructor(
     private readonly oq: OpenQueryService,
+    private readonly erpApi: ErpApiService,
     private readonly prisma: PrismaService
   ) { }
 
   async fetchSaidas(params: {
+    data_inicial: string; // YYYY-MM-DD
+    data_final: string;   // YYYY-MM-DD
+    empresa: string;      // '3' por default
+    tipo?: number;        // 1=Diária, 2=Avulsa
+  }): Promise<EstoqueSaidaRow[]> {
+    return this.erpApi.comFallback(
+      () => this.fetchSaidasViaApi(params),
+      () => this.fetchSaidasViaOpenQuery(params),
+    );
+  }
+
+  /**
+   * Saídas pela erp-firebird-api. A definição de saída (tudo que não tem origem
+   * NFE/CNE) vive no catálogo de lá — a mesma regra, num lugar só, para quem
+   * mais precisar dela.
+   */
+  private async fetchSaidasViaApi(params: {
+    data_inicial: string;
+    data_final: string;
+    empresa: string;
+  }): Promise<EstoqueSaidaRow[]> {
+    const { data_inicial, data_final, empresa } = params;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data_inicial) || !/^\d{4}-\d{2}-\d{2}$/.test(data_final)) {
+      throw new BadRequestException('Datas devem ser YYYY-MM-DD');
+    }
+    if (!/^\d+$/.test(empresa)) {
+      throw new BadRequestException('Empresa inválida');
+    }
+
+    const linhas = await this.erpApi.saidasPorPeriodo(data_inicial, data_final, Number(empresa));
+    return this.explodeByLocation(linhas.map((l) => this.paraLinhaDeSaida(l)));
+  }
+
+  /**
+   * Nomes do catálogo -> nomes que a contagem usa. PRO_CODIGO/PRO_DESCRICAO são
+   * como a coluna se chama no ERP; COD_PRODUTO/DESC_PRODUTO é o contrato que a
+   * tela e o banco local já esperam.
+   */
+  private paraLinhaDeSaida(l: any): EstoqueSaidaRow {
+    return {
+      ...l,
+      COD_PRODUTO: l.PRO_CODIGO,
+      DESC_PRODUTO: l.PRO_DESCRICAO,
+    } as EstoqueSaidaRow;
+  }
+
+  private async fetchSaidasViaOpenQuery(params: {
     data_inicial: string; // YYYY-MM-DD
     data_final: string;   // YYYY-MM-DD
     empresa: string;      // '3' por default
@@ -172,7 +221,12 @@ export class EstoqueSaidasRepository {
       'JOIN PRODUTOS PRO',
       '    ON (EST.pro_codigo = PRO.pro_codigo)',
       '    AND (EST.empresa = PRO.empresa)',
-      'JOIN MARCAS MC',
+      // LEFT, e não INNER: marca é opcional no cadastro. Com INNER, produto sem
+      // MAR_CODIGO sumia da contagem sem aviso — 18.513 produtos da empresa 3
+      // estão nessa situação, e 101 deles tiveram saída só no mês de julho/2026.
+      // Numa conferência de estoque, a omissão silenciosa é pior que o dado
+      // faltando: o contador conclui que não saiu nada.
+      'LEFT JOIN MARCAS MC',
       '    ON (MC.EMPRESA = PRO.EMPRESA)',
       '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
       `WHERE EST.empresa = '${empresa}'`,
@@ -333,6 +387,74 @@ export class EstoqueSaidasRepository {
     subgrupo?: number;     // SUBGRP_CODIGO
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
   }): Promise<EstoqueSaidaRow[]> {
+    return this.erpApi.comFallback(
+      () => this.fetchProdutosPorFiltroViaApi(params),
+      () => this.fetchProdutosPorFiltroViaOpenQuery(params),
+    );
+  }
+
+  private async fetchProdutosPorFiltroViaApi(params: {
+    empresa: string;
+    cod_produto?: number;
+    marca?: number;
+    descricao?: string;
+    grupo?: number;
+    subgrupo?: number;
+    somente_com_saldo?: boolean;
+  }): Promise<EstoqueSaidaRow[]> {
+    const { empresa } = params;
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+
+    const toInt = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.trunc(n) : undefined;
+    };
+    const cod_produto = toInt(params.cod_produto);
+    const marca = toInt(params.marca);
+    const grupo = toInt(params.grupo);
+    const subgrupo = toInt(params.subgrupo);
+    const descricao = (params.descricao ?? '').trim().toUpperCase();
+
+    if (cod_produto == null && marca == null && grupo == null && subgrupo == null && !descricao) {
+      throw new BadRequestException(
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição ou código) para a contagem avulsa.'
+      );
+    }
+
+    const linhas = await this.erpApi.produtosPorFiltro({
+      empresa, cod_produto, marca, grupo, subgrupo, descricao: descricao || undefined,
+    });
+
+    const hoje = new Date();
+    // Saldo é soma de duas colunas: o catálogo filtra coluna a coluna, então
+    // este recorte fica aqui, sobre o conjunto que os outros filtros já reduziram.
+    const filtradas = params.somente_com_saldo
+      ? linhas.filter((l) => (Number(l.ESTOQUE_DISPONIVEL) || 0) + (Number(l.ESTOQUE_RESERVADO) || 0) > 0)
+      : linhas;
+
+    return this.explodeByLocation(
+      filtradas.map((l) => ({
+        ...l,
+        DATA: hoje,
+        COD_PRODUTO: l.PRO_CODIGO,
+        DESC_PRODUTO: l.PRO_DESCRICAO,
+        QTDE_SAIDA: 0,
+        ESTOQUE: l.ESTOQUE_DISPONIVEL,
+        RESERVA: l.ESTOQUE_RESERVADO,
+      })) as EstoqueSaidaRow[],
+    );
+  }
+
+  private async fetchProdutosPorFiltroViaOpenQuery(params: {
+    empresa: string;       // '3' por default
+    cod_produto?: number;
+    marca?: number;        // MAR_CODIGO
+    descricao?: string;    // LIKE em PRO.pro_descricao
+    grupo?: number;        // GRP_CODIGO
+    subgrupo?: number;     // SUBGRP_CODIGO
+    somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+  }): Promise<EstoqueSaidaRow[]> {
     const { empresa } = params;
 
     if (!/^\d+$/.test(empresa)) {
@@ -388,15 +510,15 @@ export class EstoqueSaidasRepository {
       '    PRO.estoque_disponivel AS ESTOQUE,',
       '    PRO.estoque_reservado as RESERVA',
       'FROM PRODUTOS PRO',
-      'JOIN MARCAS MC',
+      // Mesma razão do LEFT na rotativa: com INNER, produto sem marca não
+      // aparece na busca da contagem avulsa. São 2.359 produtos com saldo
+      // diferente de zero e sem MAR_CODIGO na empresa 3.
+      'LEFT JOIN MARCAS MC',
       '    ON (MC.EMPRESA = PRO.EMPRESA)',
       '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
       'LEFT JOIN PRODUTOS_SUBGRUPOS SG',
       '    ON (SG.EMPRESA = PRO.EMPRESA)',
       '    AND (SG.SUBGRP_CODIGO = PRO.SUBGRP_CODIGO)',
-      'LEFT JOIN PRODUTOS_GRUPOS GR',
-      '    ON (GR.EMPRESA = SG.EMPRESA)',
-      '    AND (GR.GRP_CODIGO = SG.GRP_CODIGO)',
       ...where,
       'ORDER BY PRO.localizacao',
     ].join('\n');
@@ -412,9 +534,27 @@ export class EstoqueSaidasRepository {
     return this.explodeByLocation(rows);
   }
 
-  /** Lista de grupos de produto (PRODUTOS_GRUPOS) para popular o filtro da avulsa. */
+  /**
+   * Lista de grupos de produto (PRODUTOS_GRUPOS) para popular o filtro da avulsa.
+   *
+   * As três listas de apoio (grupos, subgrupos, marcas) mudam raramente e são
+   * pedidas toda vez que a tela de filtro abre. Pela API elas têm cache de 5
+   * minutos do outro lado, compartilhado entre todos os serviços — três idas ao
+   * ERP por abertura de tela viram nenhuma na maior parte das vezes.
+   */
   async fetchGrupos(empresa: string): Promise<Array<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>> {
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.grupos(Number(empresa))).map((r) => ({
+          GRP_CODIGO: Number(r.GRP_CODIGO),
+          GRP_DESCRICAO: this.toUtf8Text(r.GRP_DESCRICAO) ?? '',
+        })),
+      () => this.fetchGruposViaOpenQuery(empresa),
+    );
+  }
+
+  private async fetchGruposViaOpenQuery(empresa: string): Promise<Array<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>> {
     const innerSql = [
       'SELECT GR.grp_codigo AS GRP_CODIGO, GR.grp_descricao AS GRP_DESCRICAO',
       'FROM PRODUTOS_GRUPOS GR',
@@ -435,6 +575,18 @@ export class EstoqueSaidasRepository {
   async fetchSubgrupos(empresa: string, grupo?: number): Promise<Array<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>> {
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
     const grp = grupo != null && Number.isFinite(Number(grupo)) ? Math.trunc(Number(grupo)) : undefined;
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.subgrupos(Number(empresa), grp)).map((r) => ({
+          SUBGRP_CODIGO: Number(r.SUBGRP_CODIGO),
+          SUBGRP_DESCRICAO: this.toUtf8Text(r.SUBGRP_DESCRICAO) ?? '',
+          GRP_CODIGO: Number(r.GRP_CODIGO),
+        })),
+      () => this.fetchSubgruposViaOpenQuery(empresa, grp),
+    );
+  }
+
+  private async fetchSubgruposViaOpenQuery(empresa: string, grp?: number): Promise<Array<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>> {
     const innerSql = [
       'SELECT SG.subgrp_codigo AS SUBGRP_CODIGO, SG.subgrp_descricao AS SUBGRP_DESCRICAO, SG.grp_codigo AS GRP_CODIGO',
       'FROM PRODUTOS_SUBGRUPOS SG',
@@ -456,6 +608,17 @@ export class EstoqueSaidasRepository {
   /** Lista de marcas (MARCAS) para popular o filtro da avulsa. */
   async fetchMarcas(empresa: string): Promise<Array<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>> {
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.marcas(Number(empresa))).map((r) => ({
+          MAR_CODIGO: Number(r.MAR_CODIGO),
+          MAR_DESCRICAO: this.toUtf8Text(r.MAR_DESCRICAO) ?? '',
+        })),
+      () => this.fetchMarcasViaOpenQuery(empresa),
+    );
+  }
+
+  private async fetchMarcasViaOpenQuery(empresa: string): Promise<Array<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>> {
     const innerSql = [
       'SELECT MC.mar_codigo AS MAR_CODIGO, MC.mar_descricao AS MAR_DESCRICAO',
       'FROM MARCAS MC',
@@ -949,22 +1112,47 @@ export class EstoqueSaidasRepository {
     if (!/^\d+$/.test(empresa)) {
       throw new BadRequestException('Empresa inválida');
     }
+    // O valor entra no literal Firebird: só inteiro passa.
+    if (!Number.isInteger(Number(codProduto))) {
+      throw new BadRequestException('Código de produto inválido');
+    }
 
-    // Monta o SQL que será passado DENTRO do OPENQUERY (dialeto Firebird)
+    return this.erpApi.comFallback(
+      async () => {
+        const linha = await this.erpApi.estoqueProduto(Number(codProduto), Number(empresa));
+        if (!linha) return null;
+        // Mesmas chaves que o driver devolvia (o Firebird responde em MAIÚSCULAS):
+        // quem consome lê `.ESTOQUE`, e o contrato não muda com a troca de caminho.
+        return {
+          PRO_CODIGO: Number(linha.PRO_CODIGO),
+          ESTOQUE: Number(linha.ESTOQUE_DISPONIVEL),
+        } as unknown as ConferirEstoqueResponseDto;
+      },
+      () => this.getEstoqueProdutoViaOpenQuery(codProduto, empresa),
+    );
+  }
+
+  /**
+   * A conferência pergunta produto a produto. Pela API, as chamadas unitárias
+   * que chegam juntas viram um único SELECT com IN do outro lado; por aqui,
+   * cada uma é uma ida ao Firebird.
+   */
+  private async getEstoqueProdutoViaOpenQuery(codProduto: number, empresa: string): Promise<ConferirEstoqueResponseDto | null> {
+
+    // ESTOQUE_DISPONIVEL é coluna de PRODUTOS: o saldo sai daqui direto.
+    //
+    // A versão anterior chegava nele por LANCTOS_ESTOQUE e MARCAS, e o efeito
+    // não era lentidão — era resposta faltando. Os dois joins eram INNER, então
+    // produto sem movimentação ou sem marca devolvia ZERO linhas, e quem chama
+    // interpreta null como "não consegui saber o estoque" e usa o snapshot
+    // antigo da contagem. O saldo aparecia desatualizado sem nenhum erro no log.
     const innerSql = [
       'SELECT',
-      '    PRO.pro_codigo,',
-      '    MAX(PRO.estoque_disponivel) AS ESTOQUE',
-      'FROM lanctos_estoque EST',
-      'JOIN PRODUTOS PRO',
-      '    ON (EST.pro_codigo = PRO.pro_codigo)',
-      '    AND (EST.empresa = PRO.empresa)',
-      'JOIN MARCAS MC',
-      '    ON (MC.EMPRESA = PRO.EMPRESA)',
-      '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
-      `WHERE EST.empresa = '${empresa}'`,
-      `    AND PRO.pro_codigo = ${codProduto}`,
-      'GROUP BY PRO.pro_codigo'
+      '    PRO.PRO_CODIGO,',
+      '    PRO.ESTOQUE_DISPONIVEL AS ESTOQUE',
+      'FROM PRODUTOS PRO',
+      `WHERE PRO.EMPRESA = '${empresa}'`,
+      `    AND PRO.PRO_CODIGO = ${codProduto}`,
     ].join('\n');
 
     // Escapa aspas simples para T-SQL

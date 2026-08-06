@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { EstoqueSaidasRepository } from './contagem.repository';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OpenQueryService } from '../../shared/database/openquery/openquery.service';
+import { ErpApiService } from '../../shared/erp-api/erp-api.service';
 import { CreateContagemDto } from './dto/create-contagem.dto';
 
 // Mock do crypto.randomUUID
@@ -49,6 +50,16 @@ describe('EstoqueSaidasRepository', () => {
     query: jest.fn(),
   };
 
+  /**
+   * Cliente da erp-firebird-api desligado: `habilitado: false` faz `comFallback`
+   * ir direto ao OPENQUERY, que é o caminho que estes testes verificam. Ligar a
+   * API aqui trocaria o objeto sob teste sem que os testes soubessem.
+   */
+  const mockErpApiService = {
+    habilitado: false,
+    comFallback: jest.fn(async (_viaApi: any, viaOpenQuery: any) => viaOpenQuery()),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -60,6 +71,10 @@ describe('EstoqueSaidasRepository', () => {
         {
           provide: OpenQueryService,
           useValue: mockOpenQueryService,
+        },
+        {
+          provide: ErpApiService,
+          useValue: mockErpApiService,
         },
       ],
     }).compile();
