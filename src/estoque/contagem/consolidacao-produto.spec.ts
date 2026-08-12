@@ -75,12 +75,14 @@ describe('consolidarProdutoDia', () => {
         expect(consolidado!.cuids).toEqual(['sessao-A', 'sessao-B']);
     });
 
-    it('dá o produto como correto quando cada locação acertou numa rodada diferente', async () => {
+    it('NÃO fecha o produto misturando rodadas diferentes (1ª soma com 1ª, 3ª com 3ª)', async () => {
         const prisma = montarPrisma({
             itens: [ITEM_C13, ITEM_VM],
             cuidsAtivos: ['sessao-A', 'sessao-B'],
             logs: [
-                // Nenhuma rodada tem as duas locações, mas a última contagem de cada uma fecha.
+                // A última contagem de cada locação até soma 18, mas em rodadas
+                // diferentes — e rodadas não se misturam: nenhuma rodada inteira
+                // confirmou o estoque, então o produto segue divergente.
                 { item_id: 'item-c13', contado: 18, rodada: 1 },
                 { item_id: 'item-vm', contado: 0, rodada: 3 },
             ],
@@ -92,8 +94,9 @@ describe('consolidarProdutoDia', () => {
         expect(consolidado!.rodadas[3].cobertura_total).toBe(false);
         expect(consolidado!.todas_locacoes_contadas).toBe(true);
         expect(consolidado!.total_ultima_contagem).toBe(18);
-        expect(consolidado!.correto).toBe(true);
-        expect(consolidado!.motivo).toContain('última contagem de cada locação');
+        expect(consolidado!.correto).toBe(false);
+        expect(consolidado!.status).toBe('divergente');
+        expect(consolidado!.motivo).toBeNull();
     });
 
     it('mantém a divergência quando a soma das locações não fecha com o estoque', async () => {
@@ -159,15 +162,18 @@ describe('consolidarProdutoDia', () => {
     });
 
     it('usa o estoque informado (tempo real) no lugar do snapshot gravado', async () => {
+        // Quem chama com estoque realtime (updateItemConferir) também carimba os logs
+        // da rodada atual com esse valor — a rodada compara com o estoque dela.
         const prisma = montarPrisma({
             itens: [{ ...ITEM_C13, estoque: 18 }],
             cuidsAtivos: ['sessao-A'],
-            logs: [{ item_id: 'item-c13', contado: 20, rodada: 1 }],
+            logs: [{ item_id: 'item-c13', contado: 20, rodada: 1, estoque: 20 }],
         });
 
         const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, { estoqueReferencia: 20 });
 
         expect(consolidado!.estoque_referencia).toBe(20);
+        expect(consolidado!.rodadas[1].bate).toBe(true);
         expect(consolidado!.correto).toBe(true);
     });
 

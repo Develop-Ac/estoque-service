@@ -20,6 +20,15 @@ export class BuscarProdutosQueryDto {
   @IsInt()
   cod_produto?: number;
 
+  @ApiProperty({
+    description: 'Vários códigos de produto separados por vírgula (ex.: "123,456") — chips da tela.',
+    example: '23251,18790',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  cod_produtos?: string;
+
   @ApiProperty({ description: 'Código da marca (MAR_CODIGO)', example: 12, required: false })
   @IsOptional()
   @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))

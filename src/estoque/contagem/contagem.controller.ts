@@ -127,9 +127,15 @@ export class EstoqueSaidasController {
     };
     const empresa = q.empresa && String(q.empresa).trim() ? String(q.empresa).trim() : '3';
 
+    // "cod_produtos=123,456" -> [123, 456]; entradas não numéricas são descartadas.
+    const codProdutos = typeof q.cod_produtos === 'string' && q.cod_produtos.trim()
+      ? q.cod_produtos.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+      : undefined;
+
     return this.service.buscarProdutosPorFiltro({
       empresa,
       cod_produto: toNum(q.cod_produto),
+      cod_produtos: codProdutos,
       marca: toNum(q.marca),
       descricao: typeof q.descricao === 'string' ? q.descricao : undefined,
       grupo: toNum(q.grupo),

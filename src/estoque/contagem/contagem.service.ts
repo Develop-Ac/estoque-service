@@ -25,6 +25,7 @@ export class EstoqueSaidasService {
   async buscarProdutosPorFiltro(filters: {
     empresa: string;
     cod_produto?: number;
+    cod_produtos?: number[];
     marca?: number;
     descricao?: string;
     grupo?: number;

@@ -417,6 +417,7 @@ export class EstoqueSaidasRepository {
   async fetchProdutosPorFiltro(params: {
     empresa: string;       // '3' por default
     cod_produto?: number;
+    cod_produtos?: number[]; // vários códigos de uma vez (chips na tela)
     marca?: number;        // MAR_CODIGO
     descricao?: string;    // LIKE em PRO.pro_descricao
     grupo?: number;        // GRP_CODIGO
@@ -449,6 +450,7 @@ export class EstoqueSaidasRepository {
   private async fetchProdutosPorFiltroViaApi(params: {
     empresa: string;
     cod_produto?: number;
+    cod_produtos?: number[];
     marca?: number;
     descricao?: string;
     grupo?: number;
@@ -465,6 +467,11 @@ export class EstoqueSaidasRepository {
       return Number.isFinite(n) ? Math.trunc(n) : undefined;
     };
     const cod_produto = toInt(params.cod_produto);
+    // União do código único com a lista de chips — a tela pode mandar os dois.
+    const codigos = [...new Set(
+      [cod_produto, ...(params.cod_produtos ?? []).map(toInt)]
+        .filter((c): c is number => c != null),
+    )];
     const marca = toInt(params.marca);
     const grupo = toInt(params.grupo);
     const subgrupo = toInt(params.subgrupo);
@@ -473,15 +480,23 @@ export class EstoqueSaidasRepository {
     // "só por piso" é legítima — traz o catálogo com saldo e filtra as locações.
     const temPiso = (params.piso ?? '').trim().length > 0;
 
-    if (cod_produto == null && marca == null && grupo == null && subgrupo == null && !descricao && !temPiso) {
+    if (codigos.length === 0 && marca == null && grupo == null && subgrupo == null && !descricao && !temPiso) {
       throw new BadRequestException(
         'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
       );
     }
 
-    const linhas = await this.erpApi.produtosPorFiltro({
-      empresa, cod_produto, marca, grupo, subgrupo, descricao: descricao || undefined,
-    });
+    // Vários códigos: uma consulta por código, em paralelo — o agrupador do outro lado
+    // junta as chamadas que chegam na mesma janela num único SELECT com IN.
+    const linhas = codigos.length > 0
+      ? (await Promise.all(
+          codigos.map((c) => this.erpApi.produtosPorFiltro({
+            empresa, cod_produto: c, marca, grupo, subgrupo, descricao: descricao || undefined,
+          })),
+        )).flat()
+      : await this.erpApi.produtosPorFiltro({
+          empresa, marca, grupo, subgrupo, descricao: descricao || undefined,
+        });
 
     const hoje = new Date();
     // Saldo é soma de duas colunas: o catálogo filtra coluna a coluna, então
@@ -506,6 +521,7 @@ export class EstoqueSaidasRepository {
   private async fetchProdutosPorFiltroViaOpenQuery(params: {
     empresa: string;       // '3' por default
     cod_produto?: number;
+    cod_produtos?: number[];
     marca?: number;        // MAR_CODIGO
     descricao?: string;    // LIKE em PRO.pro_descricao
     grupo?: number;        // GRP_CODIGO
@@ -527,6 +543,11 @@ export class EstoqueSaidasRepository {
       return Number.isFinite(n) ? Math.trunc(n) : undefined;
     };
     const codProduto = toInt(params.cod_produto);
+    // União do código único com a lista de chips; só inteiros entram no literal.
+    const codigos = [...new Set(
+      [codProduto, ...(params.cod_produtos ?? []).map(toInt)]
+        .filter((c): c is number => c != null),
+    )];
     const marca = toInt(params.marca);
     const grupo = toInt(params.grupo);
     const subgrupo = toInt(params.subgrupo);
@@ -535,7 +556,7 @@ export class EstoqueSaidasRepository {
     const descricao = (params.descricao ?? '').replace(/'/g, '').trim().toUpperCase();
 
     const temFiltro =
-      codProduto != null || marca != null || grupo != null || subgrupo != null ||
+      codigos.length > 0 || marca != null || grupo != null || subgrupo != null ||
       descricao.length > 0 || (params.piso ?? '').trim().length > 0;
     if (!temFiltro) {
       throw new BadRequestException(
@@ -544,7 +565,8 @@ export class EstoqueSaidasRepository {
     }
 
     const where: string[] = [`WHERE PRO.empresa = '${empresa}'`];
-    if (codProduto != null) where.push(`AND PRO.pro_codigo = ${codProduto}`);
+    if (codigos.length === 1) where.push(`AND PRO.pro_codigo = ${codigos[0]}`);
+    else if (codigos.length > 1) where.push(`AND PRO.pro_codigo IN (${codigos.join(', ')})`);
     if (marca != null) where.push(`AND PRO.mar_codigo = ${marca}`);
     if (grupo != null) where.push(`AND SG.grp_codigo = ${grupo}`);
     if (subgrupo != null) where.push(`AND PRO.subgrp_codigo = ${subgrupo}`);
@@ -1327,9 +1349,9 @@ export class EstoqueSaidasRepository {
       console.log(`[DEBUG] HybridValidation: Trusting Frontend value=${conferir}`);
       finalConferirValue = conferir;
     } else if (consolidado?.correto) {
-      // CASO 2: Multilocação já fechada com o estoque (nesta rodada ou somando a última
-      // contagem de cada locação) -> NENHUMA locação segue para as próximas contagens,
-      // inclusive as que estão em outras sessões.
+      // CASO 2: Multilocação já fechada com o estoque (uma rodada INTEIRA bateu — a
+      // validação nunca mistura rodadas) -> NENHUMA locação segue para as próximas
+      // contagens, inclusive as que estão em outras sessões.
       console.log(`[DEBUG] HybridValidation: Produto fechado -> ${consolidado.motivo}`);
       finalConferirValue = false;
       escopoUpdate = { id: { in: consolidado.itens_ids } };

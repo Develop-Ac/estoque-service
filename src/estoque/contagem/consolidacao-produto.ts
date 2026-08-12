@@ -15,8 +15,11 @@ import { PrismaService } from '../../prisma/prisma.service';
  *     na auditoria.
  *
  * Este helper olha o produto/dia INTEIRO (todas as locações, de todas as sessões ativas)
- * e responde se ele já foi contado corretamente — seja porque uma rodada inteira fechou,
- * seja porque a última contagem de cada locação, somada, fecha com o estoque.
+ * e responde se ele já foi contado corretamente.
+ *
+ * REGRA: rodadas NÃO se misturam. A validação soma 1ª com 1ª, 2ª com 2ª e 3ª com 3ª —
+ * nunca a 3ª de uma locação com a 2ª de outra. O produto só fecha quando UMA rodada
+ * inteira (todas as locações contadas naquela rodada) bate com o estoque vigente dela.
  */
 
 export const RODADAS = [1, 2, 3] as const;
@@ -58,7 +61,10 @@ export interface ConsolidadoProdutoDia {
     cuids: string[];
     locacoes: LocacaoConsolidada[];
     rodadas: Record<Rodada, RodadaConsolidada>;
-    /** Soma da ÚLTIMA contagem de cada locação, mesmo que em rodadas diferentes. */
+    /**
+     * Soma da ÚLTIMA contagem de cada locação (rodadas possivelmente diferentes).
+     * APENAS INFORMATIVO — não valida o produto: rodadas não se misturam.
+     */
     total_ultima_contagem: number;
     todas_locacoes_contadas: boolean;
     /** Produto fechado com o estoque -> não precisa seguir para as próximas contagens. */
@@ -239,14 +245,16 @@ export async function consolidarProdutoDia(
     }
 
     // ---- Visão "última contagem de cada locação" ----
-    // Cobre o caso em que cada locação acertou numa rodada diferente: a locação A foi
-    // contada certa na 1ª e parou por ali, enquanto a locação B só apareceu na 2ª/3ª.
+    // Só para exibição (auditoria mostra a soma mais recente de cada locação). NÃO
+    // valida o produto: misturar a 3ª de uma locação com a 2ª de outra daria como
+    // certo um produto que nenhuma rodada inteira confirmou.
     const todas_locacoes_contadas = locacoes.every(l => l.ultima_rodada !== null);
     const total_ultima_contagem = locacoes.reduce((acc, l) => acc + l.ultima_qtd, 0);
 
+    // O produto só fecha quando UMA rodada completa (todas as locações contadas
+    // naquela mesma rodada) soma o estoque vigente dela.
     const rodadaQueBateu = RODADAS.find(r => rodadas[r].bate) ?? null;
-    const fechaPelaUltima = todas_locacoes_contadas && total_ultima_contagem === estoqueReferencia;
-    const correto = !!rodadaQueBateu || fechaPelaUltima;
+    const correto = !!rodadaQueBateu;
 
     // Pendente sem contagem NÃO é locação pulada: é locação deliberadamente deixada para
     // uma avulsa complementar. Enquanto houver uma, a soma é parcial por definição e o
@@ -260,8 +268,6 @@ export async function consolidarProdutoDia(
     let motivo: string | null = null;
     if (rodadaQueBateu) {
         motivo = `${rodadaQueBateu}ª contagem fechou com o estoque somando todas as locações`;
-    } else if (fechaPelaUltima) {
-        motivo = 'A última contagem de cada locação, somada, fecha com o estoque';
     } else if (aguardandoPendentes) {
         motivo = `Aguardando contagem das locações pendentes: ${pendentesNaoContadas
             .map(l => l.localizacao ?? 'sem locação')

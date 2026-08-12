@@ -181,9 +181,9 @@ export class AuditoriaService {
                 3: history[3].total - estoqueSnapshot,
             };
 
-            // AUTO-AUDITORIA: o produto é dado como correto quando QUALQUER etapa fechou —
-            // uma rodada inteira somando todas as locações, ou a última contagem de cada
-            // locação (mesmo que cada uma tenha acertado numa rodada diferente).
+            // AUTO-AUDITORIA: o produto é dado como correto quando uma rodada INTEIRA
+            // fechou somando todas as locações (rodadas nunca se misturam), ou quando a
+            // 3ª contagem bateu com o estoque.
             const motivoCorreto = consolidado?.correto
                 ? consolidado.motivo
                 : (diferencas[3] === 0 ? 'Terceira contagem correta' : null);
@@ -329,39 +329,107 @@ export class AuditoriaService {
             divergentes: Set<number>;
             aguardando: Set<number>;
             dataItens: Date | null;
+            chavesProdutoDia: Set<string>;
         }>();
         for (const item of itens) {
             let resumo = resumoPorCuid.get(item.contagem_cuid);
             if (!resumo) {
-                resumo = { produtos: new Set(), divergentes: new Set(), aguardando: new Set(), dataItens: null };
+                resumo = { produtos: new Set(), divergentes: new Set(), aguardando: new Set(), dataItens: null, chavesProdutoDia: new Set() };
                 resumoPorCuid.set(item.contagem_cuid, resumo);
             }
             resumo.produtos.add(item.cod_produto);
             if (item.conferir && !item.pendente) resumo.divergentes.add(item.cod_produto);
             if (item.pendente && item.logs.length === 0) resumo.aguardando.add(item.cod_produto);
             if (!resumo.dataItens || item.data < resumo.dataItens) resumo.dataItens = item.data;
+            resumo.chavesProdutoDia.add(`${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`);
+        }
+
+        // SESSÕES VINCULADAS aparecem UMA vez: duas avulsas que compartilham um
+        // produto/dia (a que deixou a pendência e a que a adotou) são a mesma
+        // contagem aos olhos da auditoria. Union-find pelo produto/dia.
+        const pai = new Map<string, string>();
+        const find = (x: string): string => {
+            let raiz = x;
+            while (pai.get(raiz) !== raiz) raiz = pai.get(raiz) as string;
+            // compressão de caminho
+            let atual = x;
+            while (pai.get(atual) !== raiz) {
+                const proximo = pai.get(atual) as string;
+                pai.set(atual, raiz);
+                atual = proximo;
+            }
+            return raiz;
+        };
+        const unir = (a: string, b: string) => { pai.set(find(a), find(b)); };
+
+        for (const cuid of cuids) pai.set(cuid, cuid);
+        const cuidPorChave = new Map<string, string>();
+        for (const [cuid, resumo] of resumoPorCuid) {
+            for (const chave of resumo.chavesProdutoDia) {
+                const dono = cuidPorChave.get(chave);
+                if (dono) unir(cuid, dono);
+                else cuidPorChave.set(chave, cuid);
+            }
+        }
+
+        const gruposVinculados = new Map<string, string[]>();
+        for (const cuid of cuids) {
+            const raiz = find(cuid);
+            const grupo = gruposVinculados.get(raiz);
+            if (grupo) grupo.push(cuid);
+            else gruposVinculados.set(raiz, [cuid]);
         }
 
         const result: any[] = [];
-        for (const [cuid, grupo] of porCuid) {
-            const rodada1 = grupo.find(g => g.contagem === 1) ?? grupo[0];
-            const resumo = resumoPorCuid.get(cuid);
+        for (const membros of gruposVinculados.values()) {
+            // Sessão principal = a mais antiga do grupo (a origem da contagem).
+            const sessoes = membros
+                .map(cuid => {
+                    const rodadas = porCuid.get(cuid) ?? [];
+                    const rodada1 = rodadas.find(g => g.contagem === 1) ?? rodadas[0];
+                    return { cuid, rodadas, rodada1 };
+                })
+                .sort((a, b) => (a.rodada1?.created_at?.getTime() ?? 0) - (b.rodada1?.created_at?.getTime() ?? 0));
 
-            // Concluída = a 1ª rodada tem fim registrado e nenhuma rodada segue aberta.
-            const concluida = !!rodada1?.data_fim && !grupo.some(g => g.liberado_contagem);
+            const principal = sessoes[0];
+            const nomes = [...new Set(sessoes.map(s => s.rodada1?.piso).filter((p): p is string => !!p))];
+
+            const produtos = new Set<number>();
+            const divergentes = new Set<number>();
+            const aguardando = new Set<number>();
+            let dataItens: Date | null = null;
+            for (const s of sessoes) {
+                const resumo = resumoPorCuid.get(s.cuid);
+                if (!resumo) continue;
+                resumo.produtos.forEach(p => produtos.add(p));
+                resumo.divergentes.forEach(p => divergentes.add(p));
+                resumo.aguardando.forEach(p => aguardando.add(p));
+                if (resumo.dataItens && (!dataItens || resumo.dataItens < dataItens)) dataItens = resumo.dataItens;
+            }
+
+            // Concluída = TODAS as sessões do grupo com 1ª rodada finalizada e nenhuma
+            // rodada aberta.
+            const concluida = sessoes.every(
+                s => !!s.rodada1?.data_fim && !s.rodadas.some(g => g.liberado_contagem),
+            );
 
             result.push({
-                contagem_cuid: cuid,
-                nome: rodada1?.piso ?? null,
-                created_at: rodada1?.created_at ?? null,
-                data_itens: resumo?.dataItens ?? null,
-                total_produtos: resumo?.produtos.size ?? 0,
-                produtos_divergentes: resumo?.divergentes.size ?? 0,
-                produtos_aguardando: resumo?.aguardando.size ?? 0,
+                contagem_cuid: principal.cuid,
+                nome: nomes[0] ?? null,
+                // Nomes das sessões vinculadas (além da principal), sem repetição.
+                vinculadas: nomes.slice(1),
+                total_sessoes: sessoes.length,
+                created_at: principal.rodada1?.created_at ?? null,
+                data_itens: dataItens,
+                total_produtos: produtos.size,
+                produtos_divergentes: divergentes.size,
+                produtos_aguardando: aguardando.size,
                 concluida,
             });
         }
 
+        // Mais recentes primeiro (mesma ordem que a listagem de sessões tinha).
+        result.sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime());
         return result;
     }
 
@@ -384,27 +452,80 @@ export class AuditoriaService {
 
         const rodadasSessao = await this.prisma.est_contagem.findMany({
             where: { contagem_cuid: contagemCuid, status: 0 },
-            select: { contagem: true, liberado_contagem: true, data_fim: true, piso: true },
+            select: { contagem: true, piso: true },
         });
         if (rodadasSessao.length === 0) return [];
 
         const rodada1 = rodadasSessao.find(r => r.contagem === 1) ?? rodadasSessao[0];
-        const sessaoConcluida = !!rodada1?.data_fim && !rodadasSessao.some(r => r.liberado_contagem);
 
-        const itensSessao = await this.prisma.est_contagem_itens.findMany({
-            where: { contagem_cuid: contagemCuid },
-            select: { id: true, cod_produto: true, desc_produto: true, data: true, estoque: true },
-        });
-        if (itensSessao.length === 0) return [];
-
-        // Agrupa por produto/dia — a mesma chave da consolidação.
+        // Fecho transitivo das sessões vinculadas: parte da selecionada e vai puxando as
+        // avulsas ativas que compartilham produto/dia (quem deixou pendência e quem a
+        // adotou), até estabilizar. Como o seletor mostra o grupo UMA vez só, a auditoria
+        // precisa cobrir os produtos de todas as sessões do grupo — não só da principal.
         const grupos = new Map<string, { cod_produto: number; desc_produto: string; data: Date }>();
-        for (const item of itensSessao) {
-            const chave = `${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`;
-            if (!grupos.has(chave)) {
+        const cuidsVisitados = new Set<string>([contagemCuid]);
+        const fila: string[] = [contagemCuid];
+
+        while (fila.length > 0) {
+            const cuidAtual = fila.shift() as string;
+            const itensDaSessao = await this.prisma.est_contagem_itens.findMany({
+                where: { contagem_cuid: cuidAtual },
+                select: { cod_produto: true, desc_produto: true, data: true },
+            });
+
+            for (const item of itensDaSessao) {
+                const chave = `${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`;
+                if (grupos.has(chave)) continue;
                 grupos.set(chave, { cod_produto: item.cod_produto, desc_produto: item.desc_produto, data: item.data });
+
+                // Avulsas ativas que também têm este produto/dia entram no fecho.
+                const inicioDia = new Date(item.data);
+                inicioDia.setUTCHours(0, 0, 0, 0);
+                const fimDia = new Date(item.data);
+                fimDia.setUTCHours(23, 59, 59, 999);
+
+                const irmaos = await this.prisma.est_contagem_itens.findMany({
+                    where: { cod_produto: item.cod_produto, data: { gte: inicioDia, lte: fimDia } },
+                    select: { contagem_cuid: true },
+                    distinct: ['contagem_cuid'],
+                });
+                const cuidsNovos = irmaos.map(i => i.contagem_cuid).filter(c => c && !cuidsVisitados.has(c));
+                if (cuidsNovos.length > 0) {
+                    const avulsasAtivas = await this.prisma.est_contagem.findMany({
+                        where: { contagem_cuid: { in: cuidsNovos }, tipo: 2, status: 0 },
+                        select: { contagem_cuid: true },
+                    });
+                    for (const s of avulsasAtivas) {
+                        if (s.contagem_cuid && !cuidsVisitados.has(s.contagem_cuid)) {
+                            cuidsVisitados.add(s.contagem_cuid);
+                            fila.push(s.contagem_cuid);
+                        }
+                    }
+                }
             }
         }
+
+        if (grupos.size === 0) return [];
+
+        // Grupo concluído = TODAS as sessões do fecho com a 1ª rodada finalizada e
+        // nenhuma rodada aberta. É essa a régua da auto-auditoria e do bloqueio "em
+        // andamento" — a sessão selecionada pode ter acabado enquanto uma vinculada
+        // ainda conta.
+        const rodadasGrupo = await this.prisma.est_contagem.findMany({
+            where: { contagem_cuid: { in: [...cuidsVisitados] }, status: 0 },
+            select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true },
+        });
+        const rodadasPorCuid = new Map<string, typeof rodadasGrupo>();
+        for (const r of rodadasGrupo) {
+            if (!r.contagem_cuid) continue;
+            const lista = rodadasPorCuid.get(r.contagem_cuid);
+            if (lista) lista.push(r);
+            else rodadasPorCuid.set(r.contagem_cuid, [r]);
+        }
+        const grupoConcluido = [...rodadasPorCuid.values()].every(rodadas => {
+            const r1 = rodadas.find(r => r.contagem === 1) ?? rodadas[0];
+            return !!r1?.data_fim && !rodadas.some(r => r.liberado_contagem);
+        });
 
         let systemUser = await this.prisma.sis_usuarios.findFirst({ where: { nome: 'SISTEMA' } });
         if (!systemUser) {
@@ -428,9 +549,9 @@ export class AuditoriaService {
                     where: { contagem_cuid: { in: outrasSessoes }, contagem: 1, status: 0 },
                     select: { piso: true },
                 });
-                sessoesVinculadas = vinculadas
-                    .map(v => v.piso)
-                    .filter((p): p is string => !!p);
+                sessoesVinculadas = [...new Set(
+                    vinculadas.map(v => v.piso).filter((p): p is string => !!p),
+                )];
             }
 
             // Histórico consolidado: logs de TODAS as locações do produto/dia, de todas
@@ -483,9 +604,9 @@ export class AuditoriaService {
 
             const aguardandoPendentes = consolidado.status === 'aguardando_pendentes';
 
-            // Auto-auditoria CORRETO: só quando a contagem foi concluída — antes disso o
-            // resultado ainda pode mudar.
-            if (consolidado.correto && sessaoConcluida && !audetado && systemUser) {
+            // Auto-auditoria CORRETO: só quando o GRUPO todo foi concluído — antes disso
+            // o resultado ainda pode mudar.
+            if (consolidado.correto && grupoConcluido && !audetado && systemUser) {
                 const autoAudit = await this.prisma.est_auditoria.create({
                     data: {
                         contagem_cuid: contagemCuid,
@@ -534,7 +655,7 @@ export class AuditoriaService {
                 aguardando_pendentes: aguardandoPendentes,
                 locacoes_pendentes: consolidado.locacoes_pendentes_nao_contadas,
                 sessoes_vinculadas: sessoesVinculadas,
-                contagem_concluida: sessaoConcluida,
+                contagem_concluida: grupoConcluido,
                 ja_auditado: !!audetado,
                 audit_id: audetado?.id,
                 audit_dados: audetado ? {
