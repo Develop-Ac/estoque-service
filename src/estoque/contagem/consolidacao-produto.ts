@@ -27,6 +27,8 @@ export interface LocacaoConsolidada {
     contagem_cuid: string;
     localizacao: string | null;
     identificador_item: string | null;
+    /** Locação fora do escopo da sessão (avulsa): aguarda uma contagem complementar. */
+    pendente: boolean;
     /** Total contado por rodada nesta locação (null = não contada naquela rodada). */
     por_rodada: Record<Rodada, number | null>;
     /** Rodada mais recente em que a locação foi contada. */
@@ -61,6 +63,18 @@ export interface ConsolidadoProdutoDia {
     todas_locacoes_contadas: boolean;
     /** Produto fechado com o estoque -> não precisa seguir para as próximas contagens. */
     correto: boolean;
+    /**
+     * Estado consolidado em três valores:
+     *  - 'correto': fechou com o estoque.
+     *  - 'aguardando_pendentes': as locações do escopo foram contadas, mas o produto tem
+     *    locações marcadas como pendentes (avulsa parcial) ainda sem contagem. Sem elas a
+     *    soma não pode ser comparada ao estoque total — não é divergência.
+     *  - 'divergente': dá para validar (não há pendente sem contagem segurando a soma) e
+     *    a conta não fecha, ou alguém pulou uma locação do escopo.
+     */
+    status: 'correto' | 'aguardando_pendentes' | 'divergente';
+    /** Locações pendentes (fora do escopo) que ainda não foram contadas. */
+    locacoes_pendentes_nao_contadas: string[];
     motivo: string | null;
 }
 
@@ -106,6 +120,7 @@ export async function consolidarProdutoDia(
             localizacao: true,
             identificador_item: true,
             estoque: true,
+            pendente: true,
         },
     });
 
@@ -192,6 +207,7 @@ export async function consolidarProdutoDia(
             contagem_cuid: item.contagem_cuid,
             localizacao: item.localizacao,
             identificador_item: item.identificador_item,
+            pendente: item.pendente,
             por_rodada,
             ultima_rodada,
             ultima_qtd: ultima_rodada ? (por_rodada[ultima_rodada] ?? 0) : 0,
@@ -230,12 +246,26 @@ export async function consolidarProdutoDia(
 
     const rodadaQueBateu = RODADAS.find(r => rodadas[r].bate) ?? null;
     const fechaPelaUltima = todas_locacoes_contadas && total_ultima_contagem === estoqueReferencia;
+    const correto = !!rodadaQueBateu || fechaPelaUltima;
+
+    // Pendente sem contagem NÃO é locação pulada: é locação deliberadamente deixada para
+    // uma avulsa complementar. Enquanto houver uma, a soma é parcial por definição e o
+    // produto não pode ser dado nem como certo nem como divergente.
+    const pendentesNaoContadas = locacoes.filter(l => l.pendente && l.ultima_rodada === null);
+    const escopoTodoContado = locacoes
+        .filter(l => !l.pendente)
+        .every(l => l.ultima_rodada !== null);
+    const aguardandoPendentes = !correto && pendentesNaoContadas.length > 0 && escopoTodoContado;
 
     let motivo: string | null = null;
     if (rodadaQueBateu) {
         motivo = `${rodadaQueBateu}ª contagem fechou com o estoque somando todas as locações`;
     } else if (fechaPelaUltima) {
         motivo = 'A última contagem de cada locação, somada, fecha com o estoque';
+    } else if (aguardandoPendentes) {
+        motivo = `Aguardando contagem das locações pendentes: ${pendentesNaoContadas
+            .map(l => l.localizacao ?? 'sem locação')
+            .join(', ')}`;
     }
 
     return {
@@ -247,7 +277,9 @@ export async function consolidarProdutoDia(
         rodadas,
         total_ultima_contagem,
         todas_locacoes_contadas,
-        correto: !!rodadaQueBateu || fechaPelaUltima,
+        correto,
+        status: correto ? 'correto' : aguardandoPendentes ? 'aguardando_pendentes' : 'divergente',
+        locacoes_pendentes_nao_contadas: pendentesNaoContadas.map(l => l.localizacao ?? ''),
         motivo,
     };
 }

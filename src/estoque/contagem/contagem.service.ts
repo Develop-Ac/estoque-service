@@ -30,8 +30,14 @@ export class EstoqueSaidasService {
     grupo?: number;
     subgrupo?: number;
     somente_com_saldo?: boolean;
+    piso?: string;
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchProdutosPorFiltro(filters);
+  }
+
+  /** Itens pendentes de outras contagens avulsas, disponíveis para adoção. */
+  async listarItensPendentes() {
+    return this.repo.getItensPendentes();
   }
 
   async listarGrupos(empresa: string) {

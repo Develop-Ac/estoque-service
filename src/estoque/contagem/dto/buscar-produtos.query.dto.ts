@@ -57,4 +57,15 @@ export class BuscarProdutosQueryDto {
   })
   @IsBoolean()
   somente_com_saldo?: boolean = true;
+
+  @ApiProperty({
+    description:
+      'Recorte por piso/locação aplicado sobre as linhas explodidas (uma por locação). ' +
+      'Valores: PISO_A, PISO_B, PISO_C, BOX, A-BOQUETA, A-CX ESCADA, VITRINE, VM, VENDA CASADA.',
+    example: 'PISO_A',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  piso?: string;
 }

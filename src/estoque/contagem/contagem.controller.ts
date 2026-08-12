@@ -135,7 +135,20 @@ export class EstoqueSaidasController {
       grupo: toNum(q.grupo),
       subgrupo: toNum(q.subgrupo),
       somente_com_saldo: toBool(q.somente_com_saldo, true),
+      piso: typeof q.piso === 'string' && q.piso.trim() ? q.piso.trim() : undefined,
     });
+  }
+
+  @Get('pendentes')
+  @ApiOperation({
+    summary: 'Listar itens pendentes de contagens avulsas',
+    description:
+      'Locações que ficaram fora do escopo de avulsas anteriores (produto multi-locação contado parcialmente), ' +
+      'ainda sem contagem, de sessões ativas. Uma nova avulsa pode adotá-los via itens_pendentes_ids no POST.'
+  })
+  @ApiOkResponse({ description: 'Lista de itens pendentes para adoção' })
+  async getItensPendentes() {
+    return this.service.listarItensPendentes();
   }
 
   @Get('grupos')

@@ -124,6 +124,35 @@ function extractLocations(text: string | null): string[] {
   return [];
 }
 
+// Classificação de piso — mesmas regras do filtro local da tela de contagem, agora
+// aplicáveis ANTES da busca da avulsa (o valor de `piso` é o value do select do front).
+function locacaoPertenceAoPiso(locacaoRaw: string | null | undefined, piso: string): boolean {
+  const loc = (locacaoRaw ?? '').toUpperCase().trim();
+  switch (piso) {
+    case 'PISO_A':
+      return loc.startsWith('A') || loc.startsWith('BOX');
+    case 'PISO_B':
+      return loc.startsWith('B') && !loc.startsWith('BOX');
+    case 'PISO_C':
+      return loc.startsWith('C');
+    case 'BOX':
+      return loc.startsWith('BOX');
+    case 'A-BOQUETA':
+      return loc.startsWith('A-BOQUETA');
+    case 'A-CX ESCADA':
+      return loc.startsWith('A-CX ESCADA');
+    case 'VITRINE':
+      // Inclui Vitrine Móvel (VM): é o mesmo colaborador que conta.
+      return loc === 'VITRINE' || /^V\d/.test(loc) || loc.startsWith('VM');
+    case 'VM':
+      return loc.startsWith('VM');
+    case 'VENDA CASADA':
+      return loc === 'VENDA CASADA';
+    default:
+      return true;
+  }
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -386,11 +415,19 @@ export class EstoqueSaidasRepository {
     grupo?: number;        // GRP_CODIGO
     subgrupo?: number;     // SUBGRP_CODIGO
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+    piso?: string;         // PISO_A, PISO_B, BOX, VITRINE... (recorte pós-explode)
   }): Promise<EstoqueSaidaRow[]> {
-    return this.erpApi.comFallback(
+    const rows = await this.erpApi.comFallback(
       () => this.fetchProdutosPorFiltroViaApi(params),
       () => this.fetchProdutosPorFiltroViaOpenQuery(params),
     );
+
+    // O piso é atributo da LOCAÇÃO, não do produto: só dá para recortar depois do
+    // explode (uma linha por locação). Por isso o filtro fica aqui, sobre as linhas
+    // prontas, e vale para os dois caminhos (API e OPENQUERY).
+    const piso = (params.piso ?? '').trim();
+    if (!piso) return rows;
+    return rows.filter((r) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, piso));
   }
 
   private async fetchProdutosPorFiltroViaApi(params: {
@@ -662,6 +699,31 @@ export class EstoqueSaidasRepository {
 
 
 
+  /**
+   * Locações conhecidas de um produto no cadastro do ERP (explodidas pelas mesmas
+   * regras da busca da avulsa). Usada para descobrir as locações que ficaram FORA do
+   * escopo de uma avulsa parcial. Falha aqui não pode derrubar a criação da contagem:
+   * devolve null e a contagem nasce sem pendências (comportamento antigo).
+   */
+  private async buscarLocacoesDoProduto(codProduto: number, empresa = '3'): Promise<string[] | null> {
+    try {
+      const rows = await this.fetchProdutosPorFiltro({
+        empresa,
+        cod_produto: codProduto,
+        somente_com_saldo: false,
+      });
+      const locs = new Set<string>();
+      for (const row of rows) {
+        const loc = this.toUtf8Text((row as any).LOCALIZACAO)?.trim();
+        if (loc) locs.add(loc);
+      }
+      return [...locs];
+    } catch (e) {
+      console.error(`[PENDENTES] Falha ao buscar locações do produto ${codProduto}; contagem segue sem pendências para ele.`, e);
+      return null;
+    }
+  }
+
   async createContagem(createContagemDto: CreateContagemDto) {
     const {
       colaborador: nomeColaboradorRaw,
@@ -669,7 +731,8 @@ export class EstoqueSaidasRepository {
       produtos,
       contagem_cuid,
       piso,
-      tipo
+      tipo,
+      itens_pendentes_ids
     } = createContagemDto;
 
     // limpa possíveis NULs no nome
@@ -711,6 +774,27 @@ export class EstoqueSaidasRepository {
         RESERVA: asNumberOrZero(p.RESERVA),
       }))
       : [];
+
+    const ehAvulsa = (tipo ?? 1) === 2;
+
+    // AVULSA PARCIAL: o Celta não separa saldo por locação, então um produto contado em
+    // UMA locação só valida quando as outras também forem contadas. Aqui buscamos as
+    // locações completas de cada produto no cadastro (fora da transação — é ida ao ERP)
+    // para criar as que ficaram fora do escopo como itens PENDENTES.
+    const pendencias: Array<{ cod_produto: number; desc_produto: string; locacoes_pendentes: string[] }> = [];
+    const locacoesCompletas = new Map<number, string[]>();
+    if (ehAvulsa && produtosSanitizados.length > 0) {
+      const jaTemItens = await this.prisma.est_contagem_itens.count({
+        where: { contagem_cuid: grupoContagem },
+      });
+      if (jaTemItens === 0) {
+        const codigos = [...new Set(produtosSanitizados.map(p => p.COD_PRODUTO).filter(c => c > 0))];
+        for (const cod of codigos) {
+          const locs = await this.buscarLocacoesDoProduto(cod);
+          if (locs) locacoesCompletas.set(cod, locs);
+        }
+      }
+    }
 
     // Usar transação para criar contagem e itens separadamente
     const contagemResult = await this.prisma.$transaction(async (tx) => {
@@ -782,8 +866,64 @@ export class EstoqueSaidasRepository {
             console.log(`[AUTO-VERSION] Produto/dia ${chaveBase} já contado em outra sessão. Gerando versão: ${targetIdentificador}`);
           }
 
+          // Itens que este produto/dia já tem em OUTRAS sessões ativas (avulsa): uma
+          // locação não pode existir duas vezes no consolidado — se existisse, um
+          // fantasma duplicado nunca seria contado e o produto ficaria aguardando para
+          // sempre. Locação selecionada que já existe como fantasma é ADOTADA; fantasma
+          // só nasce para locação que ainda não existe em lugar nenhum.
+          let fantasmaPorLocacao = new Map<string, { id: string }>();
+          const locacoesJaExistentes = new Set<string>();
+          if (ehAvulsa) {
+            const base = produtosDoGrupo[0];
+            const diaIni = new Date(base.DATA);
+            diaIni.setUTCHours(0, 0, 0, 0);
+            const diaFim = new Date(base.DATA);
+            diaFim.setUTCHours(23, 59, 59, 999);
+
+            const existentes = await tx.est_contagem_itens.findMany({
+              where: {
+                cod_produto: base.COD_PRODUTO,
+                data: { gte: diaIni, lte: diaFim },
+              },
+              select: { id: true, localizacao: true, pendente: true, contagem_cuid: true, logs: { select: { id: true }, take: 1 } },
+            });
+
+            if (existentes.length > 0) {
+              const cuidsExistentes = [...new Set(existentes.map((e) => e.contagem_cuid))];
+              const sessoesAtivas = await tx.est_contagem.findMany({
+                where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
+                select: { contagem_cuid: true },
+              });
+              const cuidsAtivos = new Set(sessoesAtivas.map((s) => s.contagem_cuid));
+
+              for (const e of existentes) {
+                if (!cuidsAtivos.has(e.contagem_cuid)) continue;
+                const key = (e.localizacao ?? '').toUpperCase().trim();
+                if (!key) continue;
+                locacoesJaExistentes.add(key);
+                if (e.pendente && e.logs.length === 0) {
+                  fantasmaPorLocacao.set(key, { id: e.id });
+                }
+              }
+            }
+          }
+
           // Todas as N localizações deste produto/dia recebem o MESMO identificador.
           for (const produto of produtosDoGrupo) {
+            const locKey = (produto.LOCALIZACAO ?? '').toUpperCase().trim();
+            const fantasma = fantasmaPorLocacao.get(locKey);
+            if (fantasma) {
+              // A locação selecionada já existe como pendente de outra avulsa do mesmo
+              // dia: adota o item em vez de duplicar a locação no consolidado.
+              const adotado = await tx.est_contagem_itens.update({
+                where: { id: fantasma.id },
+                data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
+              });
+              fantasmaPorLocacao.delete(locKey);
+              itens.push(adotado);
+              continue;
+            }
+
             const item = await tx.est_contagem_itens.create({
               data: {
                 identificador_item: targetIdentificador,
@@ -804,6 +944,86 @@ export class EstoqueSaidasRepository {
             });
             itens.push(item);
           }
+
+          // AVULSA PARCIAL: locações do cadastro que ficaram fora da seleção viram itens
+          // PENDENTES da mesma sessão (mesmo identificador e mesma data — é isso que
+          // permite à consolidação enxergar o produto/dia inteiro). Elas não aparecem
+          // para o contador; ficam aguardando uma avulsa complementar que as adote.
+          if (ehAvulsa) {
+            const base = produtosDoGrupo[0];
+            const todas = locacoesCompletas.get(base.COD_PRODUTO) ?? [];
+            const selecionadas = new Set(
+              produtosDoGrupo
+                .map((p) => (p.LOCALIZACAO ?? '').toUpperCase().trim())
+                .filter(Boolean),
+            );
+            const faltantes = todas.filter((loc) => {
+              const key = loc.toUpperCase().trim();
+              // Fora se foi selecionada agora OU se já existe (contada ou pendente) em
+              // outra sessão ativa do mesmo produto/dia.
+              return !selecionadas.has(key) && !locacoesJaExistentes.has(key);
+            });
+
+            for (const loc of faltantes) {
+              const item = await tx.est_contagem_itens.create({
+                data: {
+                  identificador_item: targetIdentificador,
+                  contagem_cuid: grupoContagem,
+                  data: base.DATA,
+                  cod_produto: base.COD_PRODUTO,
+                  desc_produto: base.DESC_PRODUTO ?? '',
+                  mar_descricao: base.MAR_DESCRICAO,
+                  ref_fabricante: base.REF_FABRICANTE,
+                  ref_fornecedor: base.REF_FORNECEDOR,
+                  localizacao: loc,
+                  unidade: base.UNIDADE,
+                  aplicacoes: null,
+                  qtde_saida: 0,
+                  estoque: base.ESTOQUE,
+                  reserva: base.RESERVA,
+                  pendente: true,
+                  conferir: false,
+                },
+              });
+              itens.push(item);
+            }
+
+            if (faltantes.length > 0) {
+              pendencias.push({
+                cod_produto: base.COD_PRODUTO,
+                desc_produto: base.DESC_PRODUTO ?? '',
+                locacoes_pendentes: faltantes,
+              });
+            }
+          }
+        }
+
+        // ADOÇÃO DE PENDENTES: itens que outra avulsa deixou aguardando entram nesta
+        // sessão. O item MUDA de sessão (contagem_cuid novo) mas conserva data e
+        // identificador — assim a contagem feita aqui fecha a consolidação do
+        // produto/dia da sessão de origem.
+        if (ehAvulsa && Array.isArray(itens_pendentes_ids) && itens_pendentes_ids.length > 0) {
+          const adotaveis = await tx.est_contagem_itens.findMany({
+            where: {
+              id: { in: itens_pendentes_ids },
+              pendente: true,
+              logs: { none: {} },
+            },
+          });
+
+          for (const itemPendente of adotaveis) {
+            const adotado = await tx.est_contagem_itens.update({
+              where: { id: itemPendente.id },
+              data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
+            });
+            itens.push(adotado);
+          }
+
+          if (adotaveis.length < itens_pendentes_ids.length) {
+            console.log(
+              `[PENDENTES] ${itens_pendentes_ids.length - adotaveis.length} item(ns) não adotado(s): já contados, já adotados ou inexistentes.`,
+            );
+          }
         }
       } else {
         itens = itensExistentes;
@@ -812,7 +1032,9 @@ export class EstoqueSaidasRepository {
       return { ...contagem, itens };
     });
 
-    return contagemResult;
+    // `pendencias` alimenta o aviso da tela: "esses produtos têm locações que ficaram
+    // pendentes de contagem". Vazio na diária e quando o produto só tem uma locação.
+    return { ...contagemResult, pendencias };
   }
 
   async getContagensByUsuario(idUsuario: string) {
@@ -847,13 +1069,17 @@ export class EstoqueSaidasRepository {
       }
     });
 
-    // Buscar os itens separadamente usando contagem_cuid
+    // Buscar os itens separadamente usando contagem_cuid.
+    // Itens PENDENTES ficam fora da lista do contador: são locações que a avulsa
+    // deliberadamente deixou para uma contagem complementar — quem os conta é a
+    // sessão que os adotar (aí deixam de ser pendentes e aparecem).
     const contagensComItens = await Promise.all(
       contagens.map(async (contagem) => {
         if (contagem.contagem_cuid) {
           const itens = await this.prisma.est_contagem_itens.findMany({
             where: {
-              contagem_cuid: contagem.contagem_cuid
+              contagem_cuid: contagem.contagem_cuid,
+              pendente: false
             },
             orderBy: {
               cod_produto: 'asc'
@@ -1032,6 +1258,12 @@ export class EstoqueSaidasRepository {
       // fechou -> divergência confirmada pelo BACK.
       console.log(`[DEBUG] HybridValidation: Enforcing Backend value=true (soma ${consolidado.rodadas[rodadaAtual as Rodada].total} x estoque ${consolidado.estoque_referencia})`);
       finalConferirValue = true;
+    } else if (consolidado?.status === 'aguardando_pendentes') {
+      // CASO 3b: Avulsa parcial com o escopo todo contado — só faltam as locações
+      // PENDENTES (deixadas de propósito para outra contagem). A soma parcial não pode
+      // ser comparada ao estoque total, então não há divergência a marcar.
+      console.log(`[DEBUG] HybridValidation: Aguardando pendentes -> ${consolidado.motivo}`);
+      finalConferirValue = false;
     } else {
       // CASO 4: Ainda falta contar alguma locação (possivelmente em outra sessão).
       // Sem o total não dá para validar -> CONFIA NO FRONT (status provisório).
@@ -1350,6 +1582,17 @@ export class EstoqueSaidasRepository {
         }
 
         console.log(`[DEBUG] reconciliar: produto ${grupo.cod_produto} OK -> ${consolidado.motivo}`);
+      } else if (consolidado.status === 'aguardando_pendentes') {
+        // Avulsa parcial: as locações do escopo foram contadas, mas o produto tem
+        // locações pendentes sem contagem. A soma é parcial por definição — não é
+        // divergência e o produto NÃO segue para a 2ª/3ª contagem. Desmarca `conferir`
+        // (o app pode ter marcado provisoriamente, já que ele só enxerga a soma parcial).
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: grupo.itensIds } },
+          data: { conferir: false },
+        });
+
+        console.log(`[DEBUG] reconciliar: produto ${grupo.cod_produto} PENDENTE -> ${consolidado.motivo}`);
       } else {
         algumProdutoDivergente = true;
         await this.prisma.est_contagem_itens.updateMany({
@@ -1364,6 +1607,43 @@ export class EstoqueSaidasRepository {
     }
 
     return { algumProdutoDivergente, temItens: true };
+  }
+
+  /**
+   * Itens PENDENTES disponíveis para adoção: locações que avulsas anteriores deixaram
+   * fora do escopo, ainda sem nenhuma contagem, de sessões ativas. É a lista que a tela
+   * "buscar pendentes de outra avulsa" mostra.
+   */
+  async getItensPendentes() {
+    const itens = await this.prisma.est_contagem_itens.findMany({
+      where: { pendente: true, logs: { none: {} } },
+      orderBy: [{ cod_produto: 'asc' }],
+    });
+
+    if (itens.length === 0) return [];
+
+    // Só valem pendências de sessão ativa; o nome da contagem de origem (coluna
+    // 'piso') vai junto para o usuário saber de onde a pendência veio.
+    const cuids = [...new Set(itens.map(i => i.contagem_cuid))];
+    const sessoes = await this.prisma.est_contagem.findMany({
+      where: { contagem_cuid: { in: cuids }, status: 0, tipo: 2 },
+      select: { contagem_cuid: true, piso: true, created_at: true },
+    });
+
+    const sessaoPorCuid = new Map<string, { piso: string | null; created_at: Date }>();
+    for (const s of sessoes) {
+      if (s.contagem_cuid && !sessaoPorCuid.has(s.contagem_cuid)) {
+        sessaoPorCuid.set(s.contagem_cuid, { piso: s.piso, created_at: s.created_at });
+      }
+    }
+
+    return itens
+      .filter(i => sessaoPorCuid.has(i.contagem_cuid))
+      .map(i => ({
+        ...i,
+        contagem_origem: sessaoPorCuid.get(i.contagem_cuid)?.piso ?? null,
+        criada_em: sessaoPorCuid.get(i.contagem_cuid)?.created_at ?? null,
+      }));
   }
 
   async getContagensByGrupo(contagem_cuid: string) {
