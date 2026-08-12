@@ -153,6 +153,13 @@ function locacaoPertenceAoPiso(locacaoRaw: string | null | undefined, piso: stri
   }
 }
 
+// Prateleira = os dois dígitos após a letra do piso (A1204E02 -> 12). Mesma regra do
+// filtro local da tela de contagem.
+function extrairPrateleira(locacaoRaw: string | null | undefined): number | null {
+  const m = (locacaoRaw ?? '').toUpperCase().trim().match(/^[A-Z](\d{2})/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -416,18 +423,27 @@ export class EstoqueSaidasRepository {
     subgrupo?: number;     // SUBGRP_CODIGO
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
     piso?: string;         // PISO_A, PISO_B, BOX, VITRINE... (recorte pós-explode)
+    prateleira?: number;   // dois dígitos após a letra do piso (recorte pós-explode)
   }): Promise<EstoqueSaidaRow[]> {
     const rows = await this.erpApi.comFallback(
       () => this.fetchProdutosPorFiltroViaApi(params),
       () => this.fetchProdutosPorFiltroViaOpenQuery(params),
     );
 
-    // O piso é atributo da LOCAÇÃO, não do produto: só dá para recortar depois do
-    // explode (uma linha por locação). Por isso o filtro fica aqui, sobre as linhas
-    // prontas, e vale para os dois caminhos (API e OPENQUERY).
+    // Piso e prateleira são atributos da LOCAÇÃO, não do produto: só dá para recortar
+    // depois do explode (uma linha por locação). Por isso o filtro fica aqui, sobre as
+    // linhas prontas, e vale para os dois caminhos (API e OPENQUERY).
     const piso = (params.piso ?? '').trim();
-    if (!piso) return rows;
-    return rows.filter((r) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, piso));
+    let filtradas = rows;
+    if (piso) {
+      filtradas = filtradas.filter((r) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, piso));
+    }
+    if (params.prateleira != null && Number.isFinite(params.prateleira)) {
+      filtradas = filtradas.filter(
+        (r) => extrairPrateleira((r as any).LOCALIZACAO) === params.prateleira,
+      );
+    }
+    return filtradas;
   }
 
   private async fetchProdutosPorFiltroViaApi(params: {
@@ -438,6 +454,7 @@ export class EstoqueSaidasRepository {
     grupo?: number;
     subgrupo?: number;
     somente_com_saldo?: boolean;
+    piso?: string;
   }): Promise<EstoqueSaidaRow[]> {
     const { empresa } = params;
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
@@ -452,10 +469,13 @@ export class EstoqueSaidasRepository {
     const grupo = toInt(params.grupo);
     const subgrupo = toInt(params.subgrupo);
     const descricao = (params.descricao ?? '').trim().toUpperCase();
+    // Piso conta como filtro: o recorte acontece pós-explode (no wrapper), mas a busca
+    // "só por piso" é legítima — traz o catálogo com saldo e filtra as locações.
+    const temPiso = (params.piso ?? '').trim().length > 0;
 
-    if (cod_produto == null && marca == null && grupo == null && subgrupo == null && !descricao) {
+    if (cod_produto == null && marca == null && grupo == null && subgrupo == null && !descricao && !temPiso) {
       throw new BadRequestException(
-        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição ou código) para a contagem avulsa.'
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
       );
     }
 
@@ -491,6 +511,7 @@ export class EstoqueSaidasRepository {
     grupo?: number;        // GRP_CODIGO
     subgrupo?: number;     // SUBGRP_CODIGO
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+    piso?: string;
   }): Promise<EstoqueSaidaRow[]> {
     const { empresa } = params;
 
@@ -514,10 +535,11 @@ export class EstoqueSaidasRepository {
     const descricao = (params.descricao ?? '').replace(/'/g, '').trim().toUpperCase();
 
     const temFiltro =
-      codProduto != null || marca != null || grupo != null || subgrupo != null || descricao.length > 0;
+      codProduto != null || marca != null || grupo != null || subgrupo != null ||
+      descricao.length > 0 || (params.piso ?? '').trim().length > 0;
     if (!temFiltro) {
       throw new BadRequestException(
-        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição ou código) para a contagem avulsa.'
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
       );
     }
 
@@ -640,6 +662,64 @@ export class EstoqueSaidasRepository {
       SUBGRP_DESCRICAO: this.toUtf8Text((r as any).SUBGRP_DESCRICAO) ?? '',
       GRP_CODIGO: Number((r as any).GRP_CODIGO),
     }));
+  }
+
+  // Cache da varredura de locações (para o filtro-filho de prateleiras): a lista de
+  // locações do catálogo muda devagar e a varredura é uma ida cara ao Firebird.
+  private locacoesCatalogoCache: { empresa: string; expiraEm: number; locacoes: string[] } | null = null;
+
+  /**
+   * Prateleiras existentes num piso — o filtro-filho da avulsa: escolhido o piso, só as
+   * prateleiras dele são oferecidas. Prateleira são os dois dígitos após a letra da
+   * locação (A1204E02 -> 12), então a lista sai de uma varredura só das colunas de
+   * locação dos produtos com saldo, explodida pelas mesmas regras da contagem.
+   */
+  async fetchPrateleirasPorPiso(empresa: string, piso: string): Promise<number[]> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    if (!piso?.trim()) throw new BadRequestException('Informe o piso');
+
+    const agora = Date.now();
+    let locacoes: string[];
+
+    if (
+      this.locacoesCatalogoCache &&
+      this.locacoesCatalogoCache.empresa === empresa &&
+      this.locacoesCatalogoCache.expiraEm > agora
+    ) {
+      locacoes = this.locacoesCatalogoCache.locacoes;
+    } else {
+      const innerSql = [
+        'SELECT PRO.localizacao, PRO.aplicacoes',
+        'FROM PRODUTOS PRO',
+        `WHERE PRO.empresa = '${empresa}'`,
+        'AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0',
+      ].join('\n');
+      const innerEscaped = innerSql.replace(/'/g, "''");
+      const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any }>(
+        `/* prateleiras-por-piso OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
+        {},
+        { timeout: 120_000 },
+      );
+
+      const set = new Set<string>();
+      for (const row of rows ?? []) {
+        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+        const rawApp = this.toUtf8Text((row as any).APLICACOES);
+        const principais = extractLocations(rawLoc);
+        for (const l of principais.length ? principais : (rawLoc ? [rawLoc] : [])) set.add(l);
+        for (const l of extractLocations(rawApp)) set.add(l);
+      }
+      locacoes = [...set];
+      this.locacoesCatalogoCache = { empresa, expiraEm: agora + 5 * 60_000, locacoes };
+    }
+
+    const prateleiras = new Set<number>();
+    for (const loc of locacoes) {
+      if (!locacaoPertenceAoPiso(loc, piso)) continue;
+      const p = extrairPrateleira(loc);
+      if (p != null) prateleiras.add(p);
+    }
+    return [...prateleiras].sort((a, b) => a - b);
   }
 
   /** Lista de marcas (MARCAS) para popular o filtro da avulsa. */

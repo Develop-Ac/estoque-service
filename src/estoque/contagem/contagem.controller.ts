@@ -136,7 +136,19 @@ export class EstoqueSaidasController {
       subgrupo: toNum(q.subgrupo),
       somente_com_saldo: toBool(q.somente_com_saldo, true),
       piso: typeof q.piso === 'string' && q.piso.trim() ? q.piso.trim() : undefined,
+      prateleira: toNum(q.prateleira),
     });
+  }
+
+  @Get('prateleiras')
+  @ApiOperation({
+    summary: 'Listar prateleiras de um piso (filtro-filho da avulsa)',
+    description: 'Prateleiras (dois dígitos após a letra da locação) existentes no piso informado, extraídas do catálogo de produtos com saldo.'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', type: 'string' })
+  async getPrateleiras(@Query('empresa') empresa = '3', @Query('piso') piso = '') {
+    return this.service.listarPrateleiras(empresa, piso);
   }
 
   @Get('pendentes')

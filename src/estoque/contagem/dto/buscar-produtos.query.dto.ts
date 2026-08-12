@@ -68,4 +68,14 @@ export class BuscarProdutosQueryDto {
   @IsOptional()
   @IsString()
   piso?: string;
+
+  @ApiProperty({
+    description: 'Prateleira (dois dígitos após a letra da locação, ex.: A12... -> 12). Filtro-filho do piso.',
+    example: 12,
+    required: false,
+  })
+  @IsOptional()
+  @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))
+  @IsInt()
+  prateleira?: number;
 }

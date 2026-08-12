@@ -31,6 +31,7 @@ export class EstoqueSaidasService {
     subgrupo?: number;
     somente_com_saldo?: boolean;
     piso?: string;
+    prateleira?: number;
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchProdutosPorFiltro(filters);
   }
@@ -38,6 +39,11 @@ export class EstoqueSaidasService {
   /** Itens pendentes de outras contagens avulsas, disponíveis para adoção. */
   async listarItensPendentes() {
     return this.repo.getItensPendentes();
+  }
+
+  /** Prateleiras existentes no piso informado (filtro-filho da avulsa). */
+  async listarPrateleiras(empresa: string, piso: string) {
+    return this.repo.fetchPrateleirasPorPiso(empresa, piso);
   }
 
   async listarGrupos(empresa: string) {
