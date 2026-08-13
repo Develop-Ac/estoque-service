@@ -79,8 +79,10 @@ export class BuscarProdutosQueryDto {
   piso?: string;
 
   @ApiProperty({
-    description: 'Prateleira (dois dígitos após a letra da locação, ex.: A12... -> 12). Filtro-filho do piso.',
-    example: 12,
+    description:
+      'Prateleira/rua (bloco de dígitos da locação menos os 2 do prédio; 1-9 sem zero à esquerda — ' +
+      'A903B02 -> 9, A1403A03 -> 14). Filtro-filho do piso.',
+    example: 14,
     required: false,
   })
   @IsOptional()

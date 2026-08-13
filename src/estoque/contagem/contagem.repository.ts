@@ -153,11 +153,19 @@ function locacaoPertenceAoPiso(locacaoRaw: string | null | undefined, piso: stri
   }
 }
 
-// Prateleira = os dois dígitos após a letra do piso (A1204E02 -> 12). Mesma regra do
-// filtro local da tela de contagem.
+// Anatomia da locação: Piso (1-2 letras) + Rua/Prateleira (1-2 dígitos) +
+// Prédio/Coluna (2 dígitos) + Andar (letra) + Apartamento (1-2 dígitos).
+// Prateleira de 1 a 9 NÃO leva zero à esquerda: A903B02 é prateleira 9 / prédio 03,
+// e A1403A03 é prateleira 14 / prédio 03. Por isso o corte é "o bloco de dígitos
+// menos os 2 últimos (o prédio)" — nunca "os 2 primeiros dígitos".
 function extrairPrateleira(locacaoRaw: string | null | undefined): number | null {
-  const m = (locacaoRaw ?? '').toUpperCase().trim().match(/^[A-Z](\d{2})/);
-  return m ? parseInt(m[1], 10) : null;
+  const m = (locacaoRaw ?? '').toUpperCase().trim().match(/^[A-Z]{1,2}(\d{2,4})[A-Z]\d/);
+  if (!m) return null;
+  const bloco = m[1];
+  // Bloco de 2 dígitos é a forma curta sem prédio (ex.: C16D1 -> prateleira 16).
+  const prateleira = bloco.length <= 2 ? bloco : bloco.slice(0, bloco.length - 2);
+  const n = parseInt(prateleira, 10);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**

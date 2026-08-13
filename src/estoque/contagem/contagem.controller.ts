@@ -149,7 +149,9 @@ export class EstoqueSaidasController {
   @Get('prateleiras')
   @ApiOperation({
     summary: 'Listar prateleiras de um piso (filtro-filho da avulsa)',
-    description: 'Prateleiras (dois dígitos após a letra da locação) existentes no piso informado, extraídas do catálogo de produtos com saldo.'
+    description:
+      'Prateleiras/ruas existentes no piso informado, extraídas do catálogo de produtos com saldo. ' +
+      'A prateleira é o bloco de dígitos da locação menos os 2 do prédio (1-9 sem zero à esquerda: A903B02 -> 9, A1403A03 -> 14).'
   })
   @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
   @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', type: 'string' })
