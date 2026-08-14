@@ -860,6 +860,37 @@ export class EstoqueSaidasRepository {
       throw new BadRequestException(`Colaborador com nome "${nomeColaborador}" não encontrado`);
     }
 
+    // ANTI DUPLO-CLIQUE: o salvar da tela dispara 3 POSTs e demora alguns segundos; um
+    // segundo clique gera um grupo inteiro duplicado com OUTRO cuid (aconteceu em
+    // produção: dois grupos idênticos de 71 itens criados com 2s de diferença — e o
+    // grupo fantasma ainda poluía a consolidação por produto/dia, acusando divergência
+    // em tudo). Mesma rodada + mesmo nome + mesmo colaborador + mesmo tipo criados há
+    // menos de 20s = mesma intenção -> devolve a contagem que já existe. A janela é
+    // curta de propósito: refazer o assistente inteiro (buscar, selecionar, equipe)
+    // leva mais que isso, então criação legítima em sequência não é engolida.
+    const nomeContagem = piso != null ? String(piso) : null;
+    const duplicada = await this.prisma.est_contagem.findFirst({
+      where: {
+        colaborador: usuario.id,
+        contagem: tipoContagem,
+        tipo: tipo ?? 1,
+        piso: nomeContagem,
+        status: 0,
+        created_at: { gte: new Date(Date.now() - 20_000) },
+      },
+      include: { usuario: { select: { id: true, nome: true, codigo: true } } },
+    });
+
+    if (duplicada) {
+      console.log(`[ANTI-DUPLO-CLIQUE] Contagem idêntica criada há <60s (cuid=${duplicada.contagem_cuid}, rodada=${tipoContagem}); devolvendo a existente.`);
+      const itensExistentes = duplicada.contagem_cuid
+        ? await this.prisma.est_contagem_itens.findMany({
+            where: { contagem_cuid: duplicada.contagem_cuid },
+          })
+        : [];
+      return { ...duplicada, itens: itensExistentes, pendencias: [] };
+    }
+
     // Gera um CUID único se não foi fornecido
     const grupoContagem = contagem_cuid || crypto.randomUUID();
 
@@ -2029,13 +2060,22 @@ export class EstoqueSaidasRepository {
       const idsParaExcluir = grupoContagens.map(c => c.id);
 
       if (idsParaExcluir.length > 0) {
-        return await this.prisma.est_contagem.updateMany({
+        const resultado = await this.prisma.est_contagem.updateMany({
           where: { id: { in: idsParaExcluir } },
           data: {
             liberado_contagem: false,
             status: 1,
           }
         });
+
+        // O grupo excluído some da consolidação — mas as sessões que compartilhavam
+        // produto/dia com ele podem ter sido dadas como divergentes por causa das
+        // locações dele (ex.: grupo duplicado por duplo-clique: os itens sem contagem
+        // do fantasma impediam qualquer rodada de fechar). Reavalia essas sessões para
+        // limpar `conferir` e recolher rodadas liberadas sem necessidade.
+        await this.reavaliarSessoesVizinhas(contagemAlvo.contagem_cuid);
+
+        return resultado;
       }
 
     } else {
@@ -2054,6 +2094,62 @@ export class EstoqueSaidasRepository {
     }
 
     return { count: 0, message: "Nenhuma contagem excluída" };
+  }
+
+  /**
+   * Reavalia as sessões que compartilhavam produto/dia com um grupo recém-excluído.
+   * Para cada vizinha ativa: reconsolida os produtos (conferir volta a refletir a
+   * realidade sem as locações do grupo excluído) e recolhe rodadas liberadas que
+   * ficaram sem divergência para justificá-las.
+   */
+  private async reavaliarSessoesVizinhas(contagemCuidExcluido: string | null) {
+    if (!contagemCuidExcluido) return;
+
+    const itensDoGrupo = await this.prisma.est_contagem_itens.findMany({
+      where: { contagem_cuid: contagemCuidExcluido },
+      select: { cod_produto: true, data: true },
+    });
+    if (itensDoGrupo.length === 0) return;
+
+    // Produto/dia distintos do grupo excluído.
+    const chaves = new Map<string, { cod: number; ini: Date; fim: Date }>();
+    for (const item of itensDoGrupo) {
+      const dia = item.data.toISOString().slice(0, 10);
+      const chave = `${item.cod_produto}-${dia}`;
+      if (chaves.has(chave)) continue;
+      const ini = new Date(item.data);
+      ini.setUTCHours(0, 0, 0, 0);
+      const fim = new Date(item.data);
+      fim.setUTCHours(23, 59, 59, 999);
+      chaves.set(chave, { cod: item.cod_produto, ini, fim });
+    }
+
+    const cuidsVizinhos = new Set<string>();
+    for (const { cod, ini, fim } of chaves.values()) {
+      const rows = await this.prisma.est_contagem_itens.findMany({
+        where: {
+          cod_produto: cod,
+          data: { gte: ini, lte: fim },
+          NOT: { contagem_cuid: contagemCuidExcluido },
+        },
+        select: { contagem_cuid: true },
+        distinct: ['contagem_cuid'],
+      });
+      for (const r of rows) {
+        if (r.contagem_cuid) cuidsVizinhos.add(r.contagem_cuid);
+      }
+    }
+
+    for (const cuid of cuidsVizinhos) {
+      try {
+        await this.reconciliarProdutosDaSessao(cuid);
+        await this.revogarLiberacoesSemDivergencia(cuid);
+        console.log(`[EXCLUSAO] Sessão vizinha ${cuid} reavaliada após exclusão de ${contagemCuidExcluido}.`);
+      } catch (e) {
+        // Reavaliação é saneamento: falhar aqui não pode desfazer a exclusão.
+        console.error(`[EXCLUSAO] Falha ao reavaliar sessão vizinha ${cuid}`, e);
+      }
+    }
   }
 
   async updateContagemGrupo(
