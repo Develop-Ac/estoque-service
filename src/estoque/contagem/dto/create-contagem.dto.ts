@@ -139,6 +139,28 @@ export class CreateContagemDto {
 
   piso?: string;
 
+  @ApiProperty({
+    description: 'Tipo da contagem (1=Diária/Rotativa, 2=Avulsa)',
+    example: 1,
+    enum: [1, 2],
+    required: false
+  })
+  @IsOptional()
+  @IsNumber()
+  tipo?: number;
+
+  @ApiProperty({
+    description:
+      'IDs de itens PENDENTES de outras contagens avulsas a serem adotados por esta sessão. ' +
+      'O item muda de sessão (mantendo data e identificador) e deixa de ser pendente.',
+    required: false,
+    type: [String]
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  itens_pendentes_ids?: string[];
+
   @IsString()
   usuario: string
 }

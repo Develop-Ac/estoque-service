@@ -1,11 +1,14 @@
 import { Module } from '@nestjs/common';
 import { RouterModule } from '@nestjs/core';
+import { PrometheusModule } from '@willsoto/nestjs-prometheus';
+
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { PrismaModule } from './prisma/prisma.module';
 import { S3Module } from './storage/s3.module';
 import { EstoqueSaidasModule } from './estoque/contagem/contagem.module';
 import { AuditoriaModule } from './estoque/auditoria/auditoria.module';
+import { ErpApiModule } from './shared/erp-api/erp-api.module';
 import { ConfigModule } from '@nestjs/config';
 
 @Module({
@@ -15,9 +18,13 @@ import { ConfigModule } from '@nestjs/config';
     }),
     PrismaModule,
     S3Module,
-    S3Module,
+    ErpApiModule,
     EstoqueSaidasModule,
     AuditoriaModule,
+
+    PrometheusModule.register({
+      defaultMetrics: { enabled: true }, // CPU, memória, event loop, GC
+    }),
 
     // ⬇️ Prefixa *somente* esses módulos com /compras
     RouterModule.register([

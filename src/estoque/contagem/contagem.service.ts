@@ -21,6 +21,44 @@ export class EstoqueSaidasService {
     return this.repo.fetchSaidas(filters);
   }
 
+  // ===== CONTAGEM AVULSA =====
+  async buscarProdutosPorFiltro(filters: {
+    empresa: string;
+    cod_produto?: number;
+    cod_produtos?: number[];
+    marca?: number;
+    descricao?: string;
+    grupo?: number;
+    subgrupo?: number;
+    somente_com_saldo?: boolean;
+    piso?: string;
+    prateleira?: number;
+  }): Promise<EstoqueSaidaRow[]> {
+    return this.repo.fetchProdutosPorFiltro(filters);
+  }
+
+  /** Itens pendentes de outras contagens avulsas, disponíveis para adoção. */
+  async listarItensPendentes() {
+    return this.repo.getItensPendentes();
+  }
+
+  /** Prateleiras existentes no piso informado (filtro-filho da avulsa). */
+  async listarPrateleiras(empresa: string, piso: string) {
+    return this.repo.fetchPrateleirasPorPiso(empresa, piso);
+  }
+
+  async listarGrupos(empresa: string) {
+    return this.repo.fetchGrupos(empresa);
+  }
+
+  async listarSubgrupos(empresa: string, grupo?: number) {
+    return this.repo.fetchSubgrupos(empresa, grupo);
+  }
+
+  async listarMarcas(empresa: string) {
+    return this.repo.fetchMarcas(empresa);
+  }
+
   async createContagem(createContagemDto: CreateContagemDto): Promise<ContagemResponseDto> {
     try {
       const result = await this.repo.createContagem(createContagemDto);
@@ -63,8 +101,8 @@ export class EstoqueSaidasService {
     return this.repo.getEstoqueProduto(codProduto, empresa);
   }
 
-  async updateLiberadoContagem(contagem_cuid: string, contagem: number, divergencia: boolean, itensParaRevalidar?: string[]) {
-    return this.repo.updateLiberadoContagem(contagem_cuid, contagem, divergencia, itensParaRevalidar);
+  async updateLiberadoContagem(contagem_cuid: string, contagem: number, divergencia: boolean, itensParaRevalidar?: string[], data_fim?: string) {
+    return this.repo.updateLiberadoContagem(contagem_cuid, contagem, divergencia, itensParaRevalidar, data_fim);
   }
 
   async getContagensByGrupo(contagem_cuid: string): Promise<ContagemResponseDto[]> {

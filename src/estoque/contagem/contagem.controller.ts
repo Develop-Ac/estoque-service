@@ -22,6 +22,7 @@ import { UpdateLiberadoContagemDto } from './dto/update-liberado-contagem.dto';
 import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
 import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
+import { BuscarProdutosQueryDto } from './dto/buscar-produtos.query.dto';
 
 @ApiTags('Estoque')
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
@@ -95,6 +96,102 @@ export class EstoqueSaidasController {
   async getSaidas(@Query() q: GetSaidasQueryDto): Promise<EstoqueSaidaRow[]> {
     const { data_inicial, data_final, empresa = '3', tipo } = q;
     return this.service.listarSaidas({ data_inicial, data_final, empresa, tipo });
+  }
+
+  // ===== CONTAGEM AVULSA =====
+  // ATENÇÃO: estas rotas estáticas DEVEM ficar antes de @Get(':id_usuario'),
+  // senão seriam capturadas pela rota com parâmetro.
+
+  @Get('produtos')
+  @ApiOperation({
+    summary: 'Buscar produtos para contagem avulsa',
+    description:
+      'Lista produtos do cadastro aplicando filtros (grupo, subgrupo, marca, descrição, código). ' +
+      'Exige ao menos um filtro. Use para montar uma contagem avulsa (tipo=2).'
+  })
+  @ApiOkResponse({ description: 'Lista de produtos filtrados', type: EstoqueSaidaResponseDto, isArray: true })
+  @ApiBadRequestResponse({ description: 'Nenhum filtro informado ou parâmetros inválidos' })
+  async buscarProdutos(@Query() q: BuscarProdutosQueryDto): Promise<EstoqueSaidaRow[]> {
+    // Coerção manual: não há ValidationPipe global com transform, então os query
+    // params chegam como string. Trata '' como ausente para não filtrar por 0.
+    const toNum = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const toBool = (v: any, def: boolean): boolean => {
+      if (v === undefined || v === null || String(v).trim() === '') return def;
+      if (typeof v === 'boolean') return v;
+      const s = String(v).toLowerCase();
+      return s === 'true' || s === '1';
+    };
+    const empresa = q.empresa && String(q.empresa).trim() ? String(q.empresa).trim() : '3';
+
+    // "cod_produtos=123,456" -> [123, 456]; entradas não numéricas são descartadas.
+    const codProdutos = typeof q.cod_produtos === 'string' && q.cod_produtos.trim()
+      ? q.cod_produtos.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+      : undefined;
+
+    return this.service.buscarProdutosPorFiltro({
+      empresa,
+      cod_produto: toNum(q.cod_produto),
+      cod_produtos: codProdutos,
+      marca: toNum(q.marca),
+      descricao: typeof q.descricao === 'string' ? q.descricao : undefined,
+      grupo: toNum(q.grupo),
+      subgrupo: toNum(q.subgrupo),
+      somente_com_saldo: toBool(q.somente_com_saldo, true),
+      piso: typeof q.piso === 'string' && q.piso.trim() ? q.piso.trim() : undefined,
+      prateleira: toNum(q.prateleira),
+    });
+  }
+
+  @Get('prateleiras')
+  @ApiOperation({
+    summary: 'Listar prateleiras de um piso (filtro-filho da avulsa)',
+    description:
+      'Prateleiras/ruas existentes no piso informado, extraídas do catálogo de produtos com saldo. ' +
+      'A prateleira é o bloco de dígitos da locação menos os 2 do prédio (1-9 sem zero à esquerda: A903B02 -> 9, A1403A03 -> 14).'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', type: 'string' })
+  async getPrateleiras(@Query('empresa') empresa = '3', @Query('piso') piso = '') {
+    return this.service.listarPrateleiras(empresa, piso);
+  }
+
+  @Get('pendentes')
+  @ApiOperation({
+    summary: 'Listar itens pendentes de contagens avulsas',
+    description:
+      'Locações que ficaram fora do escopo de avulsas anteriores (produto multi-locação contado parcialmente), ' +
+      'ainda sem contagem, de sessões ativas. Uma nova avulsa pode adotá-los via itens_pendentes_ids no POST.'
+  })
+  @ApiOkResponse({ description: 'Lista de itens pendentes para adoção' })
+  async getItensPendentes() {
+    return this.service.listarItensPendentes();
+  }
+
+  @Get('grupos')
+  @ApiOperation({ summary: 'Listar grupos de produto (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  async getGrupos(@Query('empresa') empresa = '3') {
+    return this.service.listarGrupos(empresa);
+  }
+
+  @Get('subgrupos')
+  @ApiOperation({ summary: 'Listar subgrupos de produto (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'grupo', required: false, example: 1, type: 'number', description: 'Filtra subgrupos por grupo (GRP_CODIGO)' })
+  async getSubgrupos(@Query('empresa') empresa = '3', @Query('grupo') grupo?: string) {
+    const grp = grupo !== undefined && grupo !== '' ? Number(grupo) : undefined;
+    return this.service.listarSubgrupos(empresa, grp);
+  }
+
+  @Get('marcas')
+  @ApiOperation({ summary: 'Listar marcas (para filtro da avulsa)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  async getMarcas(@Query('empresa') empresa = '3') {
+    return this.service.listarMarcas(empresa);
   }
 
   @Get('lista')
@@ -387,7 +484,7 @@ export class EstoqueSaidasController {
     }
   })
   async updateLiberadoContagem(@Body() body: UpdateLiberadoContagemDto) {
-    return this.service.updateLiberadoContagem(body.contagem_cuid, Number(body.contagem), !!body.divergencia, body.itensParaRevalidar);
+    return this.service.updateLiberadoContagem(body.contagem_cuid, Number(body.contagem), !!body.divergencia, body.itensParaRevalidar, body.data_fim);
   }
 
   @Put('item/:id')

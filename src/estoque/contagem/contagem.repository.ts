@@ -1,11 +1,13 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { OpenQueryService } from '../../shared/database/openquery/openquery.service';
+import { ErpApiService } from '../../shared/erp-api/erp-api.service';
 import { EstoqueSaidaRow } from './contagem.types';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateContagemDto } from './dto/create-contagem.dto';
 import { ConferirEstoqueResponseDto } from './dto/conferir-estoque-response.dto';
 import { Prisma } from '@prisma/client';
 import crypto from 'crypto';
+import { consolidarProdutoDia, ConsolidadoProdutoDia, Rodada } from './consolidacao-produto';
 
 // ==== helpers de saneamento (anti-NUL) ====
 function stripNulls(s: string): string {
@@ -49,11 +51,11 @@ function formatAndValidateLocation(text: string | null): string | null {
   const upperApp = text.toUpperCase();
 
   // 1. Regras Especiais (Prioridade Alta)
-  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4)
-  // Aceita digitos (com opcional CX N) OU a palavra especifica BEBEDOR
-  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:\s+CX\s+\d+)?)\b/);
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4, BOX2A02, BOX3B01)
+  // Aceita digitos (com sub-locação opcional tipo A02, B01) OU a palavra especifica BEBEDOR
+  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:[A-Z]\d+)?(?:\s+CX\s+\d+)?)\b/i);
   if (boxMatch) {
-    return `A-${boxMatch[0]}`;
+    return boxMatch[0];
   }
 
   // BOQUETA
@@ -68,10 +70,10 @@ function formatAndValidateLocation(text: string | null): string | null {
 
 
 
-  // 3. Regra do Padrão: Letra + 2-4 Números + Letra + 1-2 Números
-  // Ex: A1204E02, C16D1
-  // Regex: \b[A-Z]\d{2,4}[A-Z]\d{1,2}\b (Case insensitive)
-  const codeRegex = /\b[A-Z]\d{2,4}[A-Z]\d{1,2}\b/gi;
+  // 3. Regra do Padrão: 1-2 Letras + 2-4 Números + Letra + 1-2 Números
+  // Ex: A1204E02, C16D1 e Vitrine Móvel VM202A01 / VM0202A01 (prefixo de 2 letras).
+  // Regex: \b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b (Case insensitive)
+  const codeRegex = /\b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b/gi;
   const matches = text.match(codeRegex);
 
   if (matches && matches.length > 0) {
@@ -83,6 +85,89 @@ function formatAndValidateLocation(text: string | null): string | null {
   return null;
 }
 
+// Versão "N locações" de formatAndValidateLocation: em vez de juntar os códigos
+// encontrados numa única string, devolve a LISTA de locações reconhecidas.
+// Espelha exatamente as mesmas regras (inclusive o BOX sem prefixo "A-").
+// - Regras especiais (BOX, BOQUETA, CX ESCADA) => 1 locação.
+// - Padrão de código (Letra+Núm+Letra+Núm) => N locações (uma por código).
+// - Nada reconhecido => lista vazia (deixa o chamador decidir o fallback).
+function extractLocations(text: string | null): string[] {
+  if (!text) return [];
+
+  const upperApp = text.toUpperCase();
+
+  // BOX (ex: BOX 03, BOX 3, BOX BEBEDOR, BOX 1 CX 4, BOX2A02, BOX3B01)
+  const boxMatch = upperApp.match(/\bBOX\s*(?:BEBEDOR|\d+(?:[A-Z]\d+)?(?:\s+CX\s+\d+)?)\b/i);
+  if (boxMatch) {
+    return [boxMatch[0]];
+  }
+
+  // BOQUETA
+  if (upperApp.includes('BOQUETA')) {
+    return ['A-BOQUETA'];
+  }
+
+  // CAIXA ESCADA / CX ESCADA
+  if (upperApp.match(/\b(?:CX|CAIXA)\s*ESCADA\b/)) {
+    return ['A-CX ESCADA'];
+  }
+
+  // Padrão de código: 1-2 Letras + 2-4 Números + Letra + 1-2 Números (ex.: A1204E02,
+  // e Vitrine Móvel VM202A01 / VM0202A01, cujo prefixo tem 2 letras).
+  // Um mesmo campo pode conter VÁRIOS códigos -> cada um vira uma locação.
+  const codeRegex = /\b[A-Z]{1,2}\d{2,4}[A-Z]\d{1,2}\b/gi;
+  const matches = text.match(codeRegex);
+  if (matches && matches.length > 0) {
+    return matches;
+  }
+
+  return [];
+}
+
+// Classificação de piso — mesmas regras do filtro local da tela de contagem, agora
+// aplicáveis ANTES da busca da avulsa (o valor de `piso` é o value do select do front).
+function locacaoPertenceAoPiso(locacaoRaw: string | null | undefined, piso: string): boolean {
+  const loc = (locacaoRaw ?? '').toUpperCase().trim();
+  switch (piso) {
+    case 'PISO_A':
+      return loc.startsWith('A') || loc.startsWith('BOX');
+    case 'PISO_B':
+      return loc.startsWith('B') && !loc.startsWith('BOX');
+    case 'PISO_C':
+      return loc.startsWith('C');
+    case 'BOX':
+      return loc.startsWith('BOX');
+    case 'A-BOQUETA':
+      return loc.startsWith('A-BOQUETA');
+    case 'A-CX ESCADA':
+      return loc.startsWith('A-CX ESCADA');
+    case 'VITRINE':
+      // Inclui Vitrine Móvel (VM): é o mesmo colaborador que conta.
+      return loc === 'VITRINE' || /^V\d/.test(loc) || loc.startsWith('VM');
+    case 'VM':
+      return loc.startsWith('VM');
+    case 'VENDA CASADA':
+      return loc === 'VENDA CASADA';
+    default:
+      return true;
+  }
+}
+
+// Anatomia da locação: Piso (1-2 letras) + Rua/Prateleira (1-2 dígitos) +
+// Prédio/Coluna (2 dígitos) + Andar (letra) + Apartamento (1-2 dígitos).
+// Prateleira de 1 a 9 NÃO leva zero à esquerda: A903B02 é prateleira 9 / prédio 03,
+// e A1403A03 é prateleira 14 / prédio 03. Por isso o corte é "o bloco de dígitos
+// menos os 2 últimos (o prédio)" — nunca "os 2 primeiros dígitos".
+function extrairPrateleira(locacaoRaw: string | null | undefined): number | null {
+  const m = (locacaoRaw ?? '').toUpperCase().trim().match(/^[A-Z]{1,2}(\d{2,4})[A-Z]\d/);
+  if (!m) return null;
+  const bloco = m[1];
+  // Bloco de 2 dígitos é a forma curta sem prédio (ex.: C16D1 -> prateleira 16).
+  const prateleira = bloco.length <= 2 ? bloco : bloco.slice(0, bloco.length - 2);
+  const n = parseInt(prateleira, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -92,10 +177,58 @@ function formatAndValidateLocation(text: string | null): string | null {
 export class EstoqueSaidasRepository {
   constructor(
     private readonly oq: OpenQueryService,
+    private readonly erpApi: ErpApiService,
     private readonly prisma: PrismaService
   ) { }
 
   async fetchSaidas(params: {
+    data_inicial: string; // YYYY-MM-DD
+    data_final: string;   // YYYY-MM-DD
+    empresa: string;      // '3' por default
+    tipo?: number;        // 1=Diária, 2=Avulsa
+  }): Promise<EstoqueSaidaRow[]> {
+    return this.erpApi.comFallback(
+      () => this.fetchSaidasViaApi(params),
+      () => this.fetchSaidasViaOpenQuery(params),
+    );
+  }
+
+  /**
+   * Saídas pela erp-firebird-api. A definição de saída (tudo que não tem origem
+   * NFE/CNE) vive no catálogo de lá — a mesma regra, num lugar só, para quem
+   * mais precisar dela.
+   */
+  private async fetchSaidasViaApi(params: {
+    data_inicial: string;
+    data_final: string;
+    empresa: string;
+  }): Promise<EstoqueSaidaRow[]> {
+    const { data_inicial, data_final, empresa } = params;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data_inicial) || !/^\d{4}-\d{2}-\d{2}$/.test(data_final)) {
+      throw new BadRequestException('Datas devem ser YYYY-MM-DD');
+    }
+    if (!/^\d+$/.test(empresa)) {
+      throw new BadRequestException('Empresa inválida');
+    }
+
+    const linhas = await this.erpApi.saidasPorPeriodo(data_inicial, data_final, Number(empresa));
+    return this.explodeByLocation(linhas.map((l) => this.paraLinhaDeSaida(l)));
+  }
+
+  /**
+   * Nomes do catálogo -> nomes que a contagem usa. PRO_CODIGO/PRO_DESCRICAO são
+   * como a coluna se chama no ERP; COD_PRODUTO/DESC_PRODUTO é o contrato que a
+   * tela e o banco local já esperam.
+   */
+  private paraLinhaDeSaida(l: any): EstoqueSaidaRow {
+    return {
+      ...l,
+      COD_PRODUTO: l.PRO_CODIGO,
+      DESC_PRODUTO: l.PRO_DESCRICAO,
+    } as EstoqueSaidaRow;
+  }
+
+  private async fetchSaidasViaOpenQuery(params: {
     data_inicial: string; // YYYY-MM-DD
     data_final: string;   // YYYY-MM-DD
     empresa: string;      // '3' por default
@@ -132,7 +265,12 @@ export class EstoqueSaidasRepository {
       'JOIN PRODUTOS PRO',
       '    ON (EST.pro_codigo = PRO.pro_codigo)',
       '    AND (EST.empresa = PRO.empresa)',
-      'JOIN MARCAS MC',
+      // LEFT, e não INNER: marca é opcional no cadastro. Com INNER, produto sem
+      // MAR_CODIGO sumia da contagem sem aviso — 18.513 produtos da empresa 3
+      // estão nessa situação, e 101 deles tiveram saída só no mês de julho/2026.
+      // Numa conferência de estoque, a omissão silenciosa é pior que o dado
+      // faltando: o contador conclui que não saiu nada.
+      'LEFT JOIN MARCAS MC',
       '    ON (MC.EMPRESA = PRO.EMPRESA)',
       '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
       `WHERE EST.empresa = '${empresa}'`,
@@ -165,53 +303,483 @@ export class EstoqueSaidasRepository {
     // Executa via .query para retornar recordset
     const rows = await this.oq.query<EstoqueSaidaRow>(outerSql, {}, { timeout: 300_000 });
 
-    const sanitizedRows = (rows ?? []).map((row, i) => {
-      let txtApp: string | null;
-      let txtLoc: string | null;
+    // Explode cada produto em N linhas — uma por localização DISTINTA.
+    // Tanto LOCALIZACAO (campo mestre) quanto APLICACOES (campo secundário) podem,
+    // cada um, conter VÁRIAS locações. Antes a lógica gerava no máximo 2 linhas por
+    // produto (1 p/ LOCALIZACAO + 1 p/ APLICACOES); agora geramos N (uma por locação,
+    // sem duplicatas) para suportar produtos com mais de duas localizações.
+    const result: EstoqueSaidaRow[] = [];
 
-      try {
-        // APLICA EXTRAÇÃO INTELIGENTE para APLICACOES:
-        // Se for "HB20", retorna null. Se for "A1204E02", retorna "A1204E02".
-        // Se for "BOX 03", retorna "A-BOX 03".
-        txtApp = formatAndValidateLocation(this.toUtf8Text((row as any).APLICACOES));
-      } catch (e) {
-        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
-        txtApp = null;
-      }
+    (rows ?? []).forEach((row, i) => {
+      const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+      const rawApp = this.toUtf8Text((row as any).APLICACOES);
 
+      // Locações do campo mestre. Se nenhuma regra reconhecer, mantemos o valor
+      // original do ERP como locação única (confiança no ERP).
+      let locsPrincipais: string[];
       try {
-        // APLICA FORMATAÇÃO + EXTRAÇÃO para LOCALIZACAO:
-        // O usuário quer que "BOX 03" vire "A-BOX 03" também no campo principal.
-        // Se a função retornar null (ex: texto irrelevante ou formato desconhecido),
-        // mantemos o valor original do banco (fallback), pois LOCALIZACAO é campo mestre.
-        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
-        const formattedLoc = formatAndValidateLocation(rawLoc);
-        txtLoc = formattedLoc ?? rawLoc; // Se não validar/formatar, usa o original (confiança no ERP)
+        const extraidas = extractLocations(rawLoc);
+        locsPrincipais = extraidas.length > 0 ? extraidas : (rawLoc ? [rawLoc] : []);
       } catch (e) {
         console.error('Falha ao converter LOCALIZACAO na linha', i, row?.COD_PRODUTO, e);
-        txtLoc = (row as any).LOCALIZACAO;
+        locsPrincipais = rawLoc ? [rawLoc] : [];
       }
 
-      return { ...row, APLICACOES: txtApp, LOCALIZACAO: txtLoc };
+      // Locações do campo APLICACOES: só entram se passarem nas regras
+      // (ex.: "HB20" é aplicação de veículo, não locação -> ignorado).
+      let locsAplicacoes: string[];
+      try {
+        locsAplicacoes = extractLocations(rawApp);
+      } catch (e) {
+        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
+        locsAplicacoes = [];
+      }
+
+      // Une (mestre primeiro), removendo duplicatas (case-insensitive).
+      const seen = new Set<string>();
+      const locacoes: string[] = [];
+      for (const loc of [...locsPrincipais, ...locsAplicacoes]) {
+        const valor = loc?.trim();
+        if (!valor) continue;
+        const key = valor.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locacoes.push(valor);
+      }
+
+      // Emite uma linha por locação. Se nada foi reconhecido, emite o item uma vez
+      // (com a localização original) para não sumir com o produto da contagem.
+      if (locacoes.length === 0) {
+        result.push({ ...row, LOCALIZACAO: rawLoc, APLICACOES: null });
+        return;
+      }
+
+      for (const loc of locacoes) {
+        result.push({ ...row, LOCALIZACAO: loc, APLICACOES: null });
+      }
     });
 
-    // Duplica os itens conforme solicitado APENAS SE TIPO = 2 (AVULSA)
-    const result: EstoqueSaidaRow[] = [];
-    for (const item of sanitizedRows) {
-      result.push(item);
+    return result;
+  }
 
-      // Só cria o segundo item se APLICACOES for válido (não nulo)
-      if (item.APLICACOES != null && item.APLICACOES.trim() !== '') {
-        // Cria uma cópia do item, coloca APLICACOES na LOCALIZACAO e zera APLICACOES
-        result.push({
-          ...item,
-          LOCALIZACAO: item.APLICACOES,
-          APLICACOES: null
-        });
+  /**
+   * Explode cada linha de produto em N linhas — uma por localização distinta —
+   * usando exatamente as mesmas regras de multilocação da contagem rotativa
+   * (campo mestre LOCALIZACAO + campo secundário APLICACOES).
+   */
+  private explodeByLocation(rows: EstoqueSaidaRow[] | undefined): EstoqueSaidaRow[] {
+    const result: EstoqueSaidaRow[] = [];
+
+    (rows ?? []).forEach((row, i) => {
+      const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+      const rawApp = this.toUtf8Text((row as any).APLICACOES);
+
+      let locsPrincipais: string[];
+      try {
+        const extraidas = extractLocations(rawLoc);
+        locsPrincipais = extraidas.length > 0 ? extraidas : (rawLoc ? [rawLoc] : []);
+      } catch (e) {
+        console.error('Falha ao converter LOCALIZACAO na linha', i, row?.COD_PRODUTO, e);
+        locsPrincipais = rawLoc ? [rawLoc] : [];
       }
-    }
+
+      let locsAplicacoes: string[];
+      try {
+        locsAplicacoes = extractLocations(rawApp);
+      } catch (e) {
+        console.error('Falha ao converter APLICACOES na linha', i, row?.COD_PRODUTO, e);
+        locsAplicacoes = [];
+      }
+
+      const seen = new Set<string>();
+      const locacoes: string[] = [];
+      for (const loc of [...locsPrincipais, ...locsAplicacoes]) {
+        const valor = loc?.trim();
+        if (!valor) continue;
+        const key = valor.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locacoes.push(valor);
+      }
+
+      if (locacoes.length === 0) {
+        result.push({ ...row, LOCALIZACAO: rawLoc, APLICACOES: null });
+        return;
+      }
+
+      for (const loc of locacoes) {
+        result.push({ ...row, LOCALIZACAO: loc, APLICACOES: null });
+      }
+    });
 
     return result;
+  }
+
+  /**
+   * CONTAGEM AVULSA: busca produtos do CADASTRO (não da movimentação) aplicando
+   * filtros escolhidos pelo usuário (grupo/subgrupo/marca/descrição/código).
+   * Diferente da rotativa, não há filtro por lanctos_estoque; QTDE_SAIDA = 0 e a
+   * DATA do item é a data atual (CURRENT_DATE). Exige ao menos um filtro para não
+   * trazer o catálogo inteiro.
+   */
+  async fetchProdutosPorFiltro(params: {
+    empresa: string;       // '3' por default
+    cod_produto?: number;
+    cod_produtos?: number[]; // vários códigos de uma vez (chips na tela)
+    marca?: number;        // MAR_CODIGO
+    descricao?: string;    // LIKE em PRO.pro_descricao
+    grupo?: number;        // GRP_CODIGO
+    subgrupo?: number;     // SUBGRP_CODIGO
+    somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+    piso?: string;         // PISO_A, PISO_B, BOX, VITRINE... (recorte pós-explode)
+    prateleira?: number;   // dois dígitos após a letra do piso (recorte pós-explode)
+  }): Promise<EstoqueSaidaRow[]> {
+    const rows = await this.erpApi.comFallback(
+      () => this.fetchProdutosPorFiltroViaApi(params),
+      () => this.fetchProdutosPorFiltroViaOpenQuery(params),
+    );
+
+    // Piso e prateleira são atributos da LOCAÇÃO, não do produto: só dá para recortar
+    // depois do explode (uma linha por locação). Por isso o filtro fica aqui, sobre as
+    // linhas prontas, e vale para os dois caminhos (API e OPENQUERY).
+    const piso = (params.piso ?? '').trim();
+    let filtradas = rows;
+    if (piso) {
+      filtradas = filtradas.filter((r) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, piso));
+    }
+    if (params.prateleira != null && Number.isFinite(params.prateleira)) {
+      filtradas = filtradas.filter(
+        (r) => extrairPrateleira((r as any).LOCALIZACAO) === params.prateleira,
+      );
+    }
+    return filtradas;
+  }
+
+  private async fetchProdutosPorFiltroViaApi(params: {
+    empresa: string;
+    cod_produto?: number;
+    cod_produtos?: number[];
+    marca?: number;
+    descricao?: string;
+    grupo?: number;
+    subgrupo?: number;
+    somente_com_saldo?: boolean;
+    piso?: string;
+  }): Promise<EstoqueSaidaRow[]> {
+    const { empresa } = params;
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+
+    const toInt = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.trunc(n) : undefined;
+    };
+    const cod_produto = toInt(params.cod_produto);
+    // União do código único com a lista de chips — a tela pode mandar os dois.
+    const codigos = [...new Set(
+      [cod_produto, ...(params.cod_produtos ?? []).map(toInt)]
+        .filter((c): c is number => c != null),
+    )];
+    const marca = toInt(params.marca);
+    const grupo = toInt(params.grupo);
+    const subgrupo = toInt(params.subgrupo);
+    const descricao = (params.descricao ?? '').trim().toUpperCase();
+    // Piso conta como filtro: o recorte acontece pós-explode (no wrapper), mas a busca
+    // "só por piso" é legítima — traz o catálogo com saldo e filtra as locações.
+    const temPiso = (params.piso ?? '').trim().length > 0;
+
+    if (codigos.length === 0 && marca == null && grupo == null && subgrupo == null && !descricao && !temPiso) {
+      throw new BadRequestException(
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
+      );
+    }
+
+    // Vários códigos: uma consulta por código, em paralelo — o agrupador do outro lado
+    // junta as chamadas que chegam na mesma janela num único SELECT com IN.
+    const linhas = codigos.length > 0
+      ? (await Promise.all(
+          codigos.map((c) => this.erpApi.produtosPorFiltro({
+            empresa, cod_produto: c, marca, grupo, subgrupo, descricao: descricao || undefined,
+          })),
+        )).flat()
+      : await this.erpApi.produtosPorFiltro({
+          empresa, marca, grupo, subgrupo, descricao: descricao || undefined,
+        });
+
+    const hoje = new Date();
+    // Saldo é soma de duas colunas: o catálogo filtra coluna a coluna, então
+    // este recorte fica aqui, sobre o conjunto que os outros filtros já reduziram.
+    const filtradas = params.somente_com_saldo
+      ? linhas.filter((l) => (Number(l.ESTOQUE_DISPONIVEL) || 0) + (Number(l.ESTOQUE_RESERVADO) || 0) > 0)
+      : linhas;
+
+    return this.explodeByLocation(
+      filtradas.map((l) => ({
+        ...l,
+        DATA: hoje,
+        COD_PRODUTO: l.PRO_CODIGO,
+        DESC_PRODUTO: l.PRO_DESCRICAO,
+        QTDE_SAIDA: 0,
+        ESTOQUE: l.ESTOQUE_DISPONIVEL,
+        RESERVA: l.ESTOQUE_RESERVADO,
+      })) as EstoqueSaidaRow[],
+    );
+  }
+
+  private async fetchProdutosPorFiltroViaOpenQuery(params: {
+    empresa: string;       // '3' por default
+    cod_produto?: number;
+    cod_produtos?: number[];
+    marca?: number;        // MAR_CODIGO
+    descricao?: string;    // LIKE em PRO.pro_descricao
+    grupo?: number;        // GRP_CODIGO
+    subgrupo?: number;     // SUBGRP_CODIGO
+    somente_com_saldo?: boolean; // (disponivel + reservado) > 0
+    piso?: string;
+  }): Promise<EstoqueSaidaRow[]> {
+    const { empresa } = params;
+
+    if (!/^\d+$/.test(empresa)) {
+      throw new BadRequestException('Empresa inválida');
+    }
+
+    // Normaliza/valida filtros numéricos. Trata ''/null/undefined/NaN como ausente
+    // (evita filtrar por 0 quando Number('') === 0).
+    const toInt = (v: any): number | undefined => {
+      if (v === undefined || v === null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.trunc(n) : undefined;
+    };
+    const codProduto = toInt(params.cod_produto);
+    // União do código único com a lista de chips; só inteiros entram no literal.
+    const codigos = [...new Set(
+      [codProduto, ...(params.cod_produtos ?? []).map(toInt)]
+        .filter((c): c is number => c != null),
+    )];
+    const marca = toInt(params.marca);
+    const grupo = toInt(params.grupo);
+    const subgrupo = toInt(params.subgrupo);
+
+    // Descrição: remove aspas simples (evita quebra do literal Firebird) e normaliza.
+    const descricao = (params.descricao ?? '').replace(/'/g, '').trim().toUpperCase();
+
+    const temFiltro =
+      codigos.length > 0 || marca != null || grupo != null || subgrupo != null ||
+      descricao.length > 0 || (params.piso ?? '').trim().length > 0;
+    if (!temFiltro) {
+      throw new BadRequestException(
+        'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
+      );
+    }
+
+    const where: string[] = [`WHERE PRO.empresa = '${empresa}'`];
+    if (codigos.length === 1) where.push(`AND PRO.pro_codigo = ${codigos[0]}`);
+    else if (codigos.length > 1) where.push(`AND PRO.pro_codigo IN (${codigos.join(', ')})`);
+    if (marca != null) where.push(`AND PRO.mar_codigo = ${marca}`);
+    if (grupo != null) where.push(`AND SG.grp_codigo = ${grupo}`);
+    if (subgrupo != null) where.push(`AND PRO.subgrp_codigo = ${subgrupo}`);
+    if (descricao.length > 0) where.push(`AND UPPER(PRO.pro_descricao) LIKE '%${descricao}%'`);
+    if (params.somente_com_saldo) {
+      where.push(`AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0`);
+    }
+
+    const innerSql = [
+      'SELECT',
+      '    CURRENT_DATE AS DATA,',
+      '    PRO.pro_codigo as COD_PRODUTO,',
+      '    PRO.pro_descricao AS DESC_PRODUTO,',
+      '    MC.mar_descricao,',
+      '    PRO.ref_fabricante,',
+      '    PRO.ref_FORNECEDOR,',
+      '    PRO.localizacao AS LOCALIZACAO,',
+      '    PRO.unidade,',
+      '    PRO.aplicacoes,',
+      '    PRO.codigo_barras,',
+      '    0 AS QTDE_SAIDA,',
+      '    PRO.estoque_disponivel AS ESTOQUE,',
+      '    PRO.estoque_reservado as RESERVA',
+      'FROM PRODUTOS PRO',
+      // Mesma razão do LEFT na rotativa: com INNER, produto sem marca não
+      // aparece na busca da contagem avulsa. São 2.359 produtos com saldo
+      // diferente de zero e sem MAR_CODIGO na empresa 3.
+      'LEFT JOIN MARCAS MC',
+      '    ON (MC.EMPRESA = PRO.EMPRESA)',
+      '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
+      'LEFT JOIN PRODUTOS_SUBGRUPOS SG',
+      '    ON (SG.EMPRESA = PRO.EMPRESA)',
+      '    AND (SG.SUBGRP_CODIGO = PRO.SUBGRP_CODIGO)',
+      ...where,
+      'ORDER BY PRO.localizacao',
+    ].join('\n');
+
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const outerSql = `
+      /* contagem-avulsa produtos OPENQUERY */
+      SELECT *
+      FROM OPENQUERY(CONSULTA, '${innerEscaped}');
+    `;
+
+    const rows = await this.oq.query<EstoqueSaidaRow>(outerSql, {}, { timeout: 300_000 });
+    return this.explodeByLocation(rows);
+  }
+
+  /**
+   * Lista de grupos de produto (PRODUTOS_GRUPOS) para popular o filtro da avulsa.
+   *
+   * As três listas de apoio (grupos, subgrupos, marcas) mudam raramente e são
+   * pedidas toda vez que a tela de filtro abre. Pela API elas têm cache de 5
+   * minutos do outro lado, compartilhado entre todos os serviços — três idas ao
+   * ERP por abertura de tela viram nenhuma na maior parte das vezes.
+   */
+  async fetchGrupos(empresa: string): Promise<Array<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.grupos(Number(empresa))).map((r) => ({
+          GRP_CODIGO: Number(r.GRP_CODIGO),
+          GRP_DESCRICAO: this.toUtf8Text(r.GRP_DESCRICAO) ?? '',
+        })),
+      () => this.fetchGruposViaOpenQuery(empresa),
+    );
+  }
+
+  private async fetchGruposViaOpenQuery(empresa: string): Promise<Array<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>> {
+    const innerSql = [
+      'SELECT GR.grp_codigo AS GRP_CODIGO, GR.grp_descricao AS GRP_DESCRICAO',
+      'FROM PRODUTOS_GRUPOS GR',
+      `WHERE GR.empresa = '${empresa}'`,
+      'ORDER BY GR.grp_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ GRP_CODIGO: number; GRP_DESCRICAO: string }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      GRP_CODIGO: Number((r as any).GRP_CODIGO),
+      GRP_DESCRICAO: this.toUtf8Text((r as any).GRP_DESCRICAO) ?? '',
+    }));
+  }
+
+  /** Lista de subgrupos (PRODUTOS_SUBGRUPOS), opcionalmente filtrada por grupo. */
+  async fetchSubgrupos(empresa: string, grupo?: number): Promise<Array<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    const grp = grupo != null && Number.isFinite(Number(grupo)) ? Math.trunc(Number(grupo)) : undefined;
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.subgrupos(Number(empresa), grp)).map((r) => ({
+          SUBGRP_CODIGO: Number(r.SUBGRP_CODIGO),
+          SUBGRP_DESCRICAO: this.toUtf8Text(r.SUBGRP_DESCRICAO) ?? '',
+          GRP_CODIGO: Number(r.GRP_CODIGO),
+        })),
+      () => this.fetchSubgruposViaOpenQuery(empresa, grp),
+    );
+  }
+
+  private async fetchSubgruposViaOpenQuery(empresa: string, grp?: number): Promise<Array<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>> {
+    const innerSql = [
+      'SELECT SG.subgrp_codigo AS SUBGRP_CODIGO, SG.subgrp_descricao AS SUBGRP_DESCRICAO, SG.grp_codigo AS GRP_CODIGO',
+      'FROM PRODUTOS_SUBGRUPOS SG',
+      `WHERE SG.empresa = '${empresa}'`,
+      ...(grp != null ? [`AND SG.grp_codigo = ${grp}`] : []),
+      'ORDER BY SG.subgrp_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ SUBGRP_CODIGO: number; SUBGRP_DESCRICAO: string; GRP_CODIGO: number }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      SUBGRP_CODIGO: Number((r as any).SUBGRP_CODIGO),
+      SUBGRP_DESCRICAO: this.toUtf8Text((r as any).SUBGRP_DESCRICAO) ?? '',
+      GRP_CODIGO: Number((r as any).GRP_CODIGO),
+    }));
+  }
+
+  // Cache da varredura de locações (para o filtro-filho de prateleiras): a lista de
+  // locações do catálogo muda devagar e a varredura é uma ida cara ao Firebird.
+  private locacoesCatalogoCache: { empresa: string; expiraEm: number; locacoes: string[] } | null = null;
+
+  /**
+   * Prateleiras existentes num piso — o filtro-filho da avulsa: escolhido o piso, só as
+   * prateleiras dele são oferecidas. Prateleira são os dois dígitos após a letra da
+   * locação (A1204E02 -> 12), então a lista sai de uma varredura só das colunas de
+   * locação dos produtos com saldo, explodida pelas mesmas regras da contagem.
+   */
+  async fetchPrateleirasPorPiso(empresa: string, piso: string): Promise<number[]> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    if (!piso?.trim()) throw new BadRequestException('Informe o piso');
+
+    const agora = Date.now();
+    let locacoes: string[];
+
+    if (
+      this.locacoesCatalogoCache &&
+      this.locacoesCatalogoCache.empresa === empresa &&
+      this.locacoesCatalogoCache.expiraEm > agora
+    ) {
+      locacoes = this.locacoesCatalogoCache.locacoes;
+    } else {
+      const innerSql = [
+        'SELECT PRO.localizacao, PRO.aplicacoes',
+        'FROM PRODUTOS PRO',
+        `WHERE PRO.empresa = '${empresa}'`,
+        'AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0',
+      ].join('\n');
+      const innerEscaped = innerSql.replace(/'/g, "''");
+      const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any }>(
+        `/* prateleiras-por-piso OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
+        {},
+        { timeout: 120_000 },
+      );
+
+      const set = new Set<string>();
+      for (const row of rows ?? []) {
+        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+        const rawApp = this.toUtf8Text((row as any).APLICACOES);
+        const principais = extractLocations(rawLoc);
+        for (const l of principais.length ? principais : (rawLoc ? [rawLoc] : [])) set.add(l);
+        for (const l of extractLocations(rawApp)) set.add(l);
+      }
+      locacoes = [...set];
+      this.locacoesCatalogoCache = { empresa, expiraEm: agora + 5 * 60_000, locacoes };
+    }
+
+    const prateleiras = new Set<number>();
+    for (const loc of locacoes) {
+      if (!locacaoPertenceAoPiso(loc, piso)) continue;
+      const p = extrairPrateleira(loc);
+      if (p != null) prateleiras.add(p);
+    }
+    return [...prateleiras].sort((a, b) => a - b);
+  }
+
+  /** Lista de marcas (MARCAS) para popular o filtro da avulsa. */
+  async fetchMarcas(empresa: string): Promise<Array<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>> {
+    if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
+    return this.erpApi.comFallback(
+      async () =>
+        (await this.erpApi.marcas(Number(empresa))).map((r) => ({
+          MAR_CODIGO: Number(r.MAR_CODIGO),
+          MAR_DESCRICAO: this.toUtf8Text(r.MAR_DESCRICAO) ?? '',
+        })),
+      () => this.fetchMarcasViaOpenQuery(empresa),
+    );
+  }
+
+  private async fetchMarcasViaOpenQuery(empresa: string): Promise<Array<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>> {
+    const innerSql = [
+      'SELECT MC.mar_codigo AS MAR_CODIGO, MC.mar_descricao AS MAR_DESCRICAO',
+      'FROM MARCAS MC',
+      `WHERE MC.empresa = '${empresa}'`,
+      'ORDER BY MC.mar_descricao',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ MAR_CODIGO: number; MAR_DESCRICAO: string }>(
+      `SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`, {}, { timeout: 120_000 }
+    );
+    return (rows ?? []).map((r) => ({
+      MAR_CODIGO: Number((r as any).MAR_CODIGO),
+      MAR_DESCRICAO: this.toUtf8Text((r as any).MAR_DESCRICAO) ?? '',
+    }));
   }
 
   toUtf8Text(val: unknown): string | null {
@@ -241,13 +809,40 @@ export class EstoqueSaidasRepository {
 
 
 
+  /**
+   * Locações conhecidas de um produto no cadastro do ERP (explodidas pelas mesmas
+   * regras da busca da avulsa). Usada para descobrir as locações que ficaram FORA do
+   * escopo de uma avulsa parcial. Falha aqui não pode derrubar a criação da contagem:
+   * devolve null e a contagem nasce sem pendências (comportamento antigo).
+   */
+  private async buscarLocacoesDoProduto(codProduto: number, empresa = '3'): Promise<string[] | null> {
+    try {
+      const rows = await this.fetchProdutosPorFiltro({
+        empresa,
+        cod_produto: codProduto,
+        somente_com_saldo: false,
+      });
+      const locs = new Set<string>();
+      for (const row of rows) {
+        const loc = this.toUtf8Text((row as any).LOCALIZACAO)?.trim();
+        if (loc) locs.add(loc);
+      }
+      return [...locs];
+    } catch (e) {
+      console.error(`[PENDENTES] Falha ao buscar locações do produto ${codProduto}; contagem segue sem pendências para ele.`, e);
+      return null;
+    }
+  }
+
   async createContagem(createContagemDto: CreateContagemDto) {
     const {
       colaborador: nomeColaboradorRaw,
       contagem: tipoContagem,
       produtos,
       contagem_cuid,
-      piso
+      piso,
+      tipo,
+      itens_pendentes_ids
     } = createContagemDto;
 
     // limpa possíveis NULs no nome
@@ -263,6 +858,37 @@ export class EstoqueSaidasRepository {
 
     if (!usuario) {
       throw new BadRequestException(`Colaborador com nome "${nomeColaborador}" não encontrado`);
+    }
+
+    // ANTI DUPLO-CLIQUE: o salvar da tela dispara 3 POSTs e demora alguns segundos; um
+    // segundo clique gera um grupo inteiro duplicado com OUTRO cuid (aconteceu em
+    // produção: dois grupos idênticos de 71 itens criados com 2s de diferença — e o
+    // grupo fantasma ainda poluía a consolidação por produto/dia, acusando divergência
+    // em tudo). Mesma rodada + mesmo nome + mesmo colaborador + mesmo tipo criados há
+    // menos de 20s = mesma intenção -> devolve a contagem que já existe. A janela é
+    // curta de propósito: refazer o assistente inteiro (buscar, selecionar, equipe)
+    // leva mais que isso, então criação legítima em sequência não é engolida.
+    const nomeContagem = piso != null ? String(piso) : null;
+    const duplicada = await this.prisma.est_contagem.findFirst({
+      where: {
+        colaborador: usuario.id,
+        contagem: tipoContagem,
+        tipo: tipo ?? 1,
+        piso: nomeContagem,
+        status: 0,
+        created_at: { gte: new Date(Date.now() - 20_000) },
+      },
+      include: { usuario: { select: { id: true, nome: true, codigo: true } } },
+    });
+
+    if (duplicada) {
+      console.log(`[ANTI-DUPLO-CLIQUE] Contagem idêntica criada há <60s (cuid=${duplicada.contagem_cuid}, rodada=${tipoContagem}); devolvendo a existente.`);
+      const itensExistentes = duplicada.contagem_cuid
+        ? await this.prisma.est_contagem_itens.findMany({
+            where: { contagem_cuid: duplicada.contagem_cuid },
+          })
+        : [];
+      return { ...duplicada, itens: itensExistentes, pendencias: [] };
     }
 
     // Gera um CUID único se não foi fornecido
@@ -290,6 +916,27 @@ export class EstoqueSaidasRepository {
       }))
       : [];
 
+    const ehAvulsa = (tipo ?? 1) === 2;
+
+    // AVULSA PARCIAL: o Celta não separa saldo por locação, então um produto contado em
+    // UMA locação só valida quando as outras também forem contadas. Aqui buscamos as
+    // locações completas de cada produto no cadastro (fora da transação — é ida ao ERP)
+    // para criar as que ficaram fora do escopo como itens PENDENTES.
+    const pendencias: Array<{ cod_produto: number; desc_produto: string; locacoes_pendentes: string[] }> = [];
+    const locacoesCompletas = new Map<number, string[]>();
+    if (ehAvulsa && produtosSanitizados.length > 0) {
+      const jaTemItens = await this.prisma.est_contagem_itens.count({
+        where: { contagem_cuid: grupoContagem },
+      });
+      if (jaTemItens === 0) {
+        const codigos = [...new Set(produtosSanitizados.map(p => p.COD_PRODUTO).filter(c => c > 0))];
+        for (const cod of codigos) {
+          const locs = await this.buscarLocacoesDoProduto(cod);
+          if (locs) locacoesCompletas.set(cod, locs);
+        }
+      }
+    }
+
     // Usar transação para criar contagem e itens separadamente
     const contagemResult = await this.prisma.$transaction(async (tx) => {
       // Criar a contagem sem itens primeiro
@@ -300,8 +947,9 @@ export class EstoqueSaidasRepository {
           contagem_cuid: grupoContagem,
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
-          piso: String(piso),
-          // tipo: createContagemDto.contagem || 1, // Salva o tipo (1=Diária, 2=Avulsa)
+          // 'piso' guarda o NOME da contagem (para avulsa, já vem com prefixo "AVULSA - ").
+          piso: piso != null ? String(piso) : null,
+          tipo: tipo ?? 1, // 1=Diária/Rotativa, 2=Avulsa
         },
         include: {
           usuario: {
@@ -318,58 +966,205 @@ export class EstoqueSaidasRepository {
       let itens: any[] = [];
 
       if (itensExistentes.length === 0) {
-        // Criar os itens associados ao contagem_cuid
+        // Agrupa os produtos por (COD_PRODUTO + data do movimento). Cada grupo é um
+        // produto/dia que pode ter N localizações — e TODAS precisam compartilhar o
+        // MESMO identificador_item para a validação de multilocação (soma das locações
+        // x estoque total) funcionar. Antes havia um limite implícito de 2 locações
+        // por identificador (slots de 2): a 3ª locação caía em "-v2" e saía do grupo.
+        const gruposPorProduto = new Map<string, typeof produtosSanitizados>();
         for (const produto of produtosSanitizados) {
-          // Extrai apenas a data no formato yyyy-mm-dd
           const dataStr = produto.DATA instanceof Date
             ? produto.DATA.toISOString().slice(0, 10)
             : String(produto.DATA).slice(0, 10);
+          const chaveBase = `${produto.COD_PRODUTO}-${dataStr}`;
+          const grupo = gruposPorProduto.get(chaveBase);
+          if (grupo) grupo.push(produto);
+          else gruposPorProduto.set(chaveBase, [produto]);
+        }
 
-          // Lógica de Versionamento Automático (Slots de 2)
-          // 1. Tenta o ID Base (v1)
-          let targetIdentificador = `${produto.COD_PRODUTO}-${dataStr}`;
+        // Criar os itens associados ao contagem_cuid — um identificador por grupo.
+        for (const [chaveBase, produtosDoGrupo] of gruposPorProduto) {
+          // Encontra uma versão de identificador ainda NÃO usada por outra sessão de
+          // contagem do mesmo produto/dia (evita colisão/mistura de logs entre sessões).
+          let targetIdentificador = chaveBase;
           let version = 1;
-
-          // Loop para encontrar um identificador com slot livre (< 2 usos)
           while (true) {
             const usageCount = await tx.est_contagem_itens.count({
               where: { identificador_item: targetIdentificador }
             });
 
-            if (usageCount < 2) {
-              // Slot livre encontrado!
+            if (usageCount === 0) {
+              // Identificador livre para esta sessão.
               break;
             }
 
-            // Slot cheio (já existem 2 locais para este ID). Tenta próxima versão.
+            // Já usado por uma sessão anterior. Tenta a próxima versão.
             version++;
-            targetIdentificador = `${produto.COD_PRODUTO}-${dataStr}-v${version}`;
+            targetIdentificador = `${chaveBase}-v${version}`;
           }
 
-          // Log de debug para confirmar versão gerada
           if (version > 1) {
-            console.log(`[AUTO-VERSION] Produto ${produto.COD_PRODUTO} excedeu limite diário. Gerando versão: ${targetIdentificador}`);
+            console.log(`[AUTO-VERSION] Produto/dia ${chaveBase} já contado em outra sessão. Gerando versão: ${targetIdentificador}`);
           }
 
-          const item = await tx.est_contagem_itens.create({
-            data: {
-              identificador_item: targetIdentificador, // Usando o ID versionado
-              contagem_cuid: grupoContagem,
-              data: produto.DATA, // salva apenas yyyy-mm-dd
-              cod_produto: produto.COD_PRODUTO,
-              desc_produto: produto.DESC_PRODUTO ?? '',
-              mar_descricao: produto.MAR_DESCRICAO,
-              ref_fabricante: produto.REF_FABRICANTE,
-              ref_fornecedor: produto.REF_FORNECEDOR,
-              localizacao: produto.LOCALIZACAO,
-              unidade: produto.UNIDADE,
-              aplicacoes: produto.APLICACOES,
-              qtde_saida: produto.QTDE_SAIDA,
-              estoque: produto.ESTOQUE,
-              reserva: produto.RESERVA,
+          // Itens que este produto/dia já tem em OUTRAS sessões ativas (avulsa): uma
+          // locação não pode existir duas vezes no consolidado — se existisse, um
+          // fantasma duplicado nunca seria contado e o produto ficaria aguardando para
+          // sempre. Locação selecionada que já existe como fantasma é ADOTADA; fantasma
+          // só nasce para locação que ainda não existe em lugar nenhum.
+          let fantasmaPorLocacao = new Map<string, { id: string }>();
+          const locacoesJaExistentes = new Set<string>();
+          if (ehAvulsa) {
+            const base = produtosDoGrupo[0];
+            const diaIni = new Date(base.DATA);
+            diaIni.setUTCHours(0, 0, 0, 0);
+            const diaFim = new Date(base.DATA);
+            diaFim.setUTCHours(23, 59, 59, 999);
+
+            const existentes = await tx.est_contagem_itens.findMany({
+              where: {
+                cod_produto: base.COD_PRODUTO,
+                data: { gte: diaIni, lte: diaFim },
+              },
+              select: { id: true, localizacao: true, pendente: true, contagem_cuid: true, logs: { select: { id: true }, take: 1 } },
+            });
+
+            if (existentes.length > 0) {
+              const cuidsExistentes = [...new Set(existentes.map((e) => e.contagem_cuid))];
+              const sessoesAtivas = await tx.est_contagem.findMany({
+                where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
+                select: { contagem_cuid: true },
+              });
+              const cuidsAtivos = new Set(sessoesAtivas.map((s) => s.contagem_cuid));
+
+              for (const e of existentes) {
+                if (!cuidsAtivos.has(e.contagem_cuid)) continue;
+                const key = (e.localizacao ?? '').toUpperCase().trim();
+                if (!key) continue;
+                locacoesJaExistentes.add(key);
+                if (e.pendente && e.logs.length === 0) {
+                  fantasmaPorLocacao.set(key, { id: e.id });
+                }
+              }
+            }
+          }
+
+          // Todas as N localizações deste produto/dia recebem o MESMO identificador.
+          for (const produto of produtosDoGrupo) {
+            const locKey = (produto.LOCALIZACAO ?? '').toUpperCase().trim();
+            const fantasma = fantasmaPorLocacao.get(locKey);
+            if (fantasma) {
+              // A locação selecionada já existe como pendente de outra avulsa do mesmo
+              // dia: adota o item em vez de duplicar a locação no consolidado.
+              const adotado = await tx.est_contagem_itens.update({
+                where: { id: fantasma.id },
+                data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
+              });
+              fantasmaPorLocacao.delete(locKey);
+              itens.push(adotado);
+              continue;
+            }
+
+            const item = await tx.est_contagem_itens.create({
+              data: {
+                identificador_item: targetIdentificador,
+                contagem_cuid: grupoContagem,
+                data: produto.DATA, // salva apenas yyyy-mm-dd
+                cod_produto: produto.COD_PRODUTO,
+                desc_produto: produto.DESC_PRODUTO ?? '',
+                mar_descricao: produto.MAR_DESCRICAO,
+                ref_fabricante: produto.REF_FABRICANTE,
+                ref_fornecedor: produto.REF_FORNECEDOR,
+                localizacao: produto.LOCALIZACAO,
+                unidade: produto.UNIDADE,
+                aplicacoes: produto.APLICACOES,
+                qtde_saida: produto.QTDE_SAIDA,
+                estoque: produto.ESTOQUE,
+                reserva: produto.RESERVA,
+              },
+            });
+            itens.push(item);
+          }
+
+          // AVULSA PARCIAL: locações do cadastro que ficaram fora da seleção viram itens
+          // PENDENTES da mesma sessão (mesmo identificador e mesma data — é isso que
+          // permite à consolidação enxergar o produto/dia inteiro). Elas não aparecem
+          // para o contador; ficam aguardando uma avulsa complementar que as adote.
+          if (ehAvulsa) {
+            const base = produtosDoGrupo[0];
+            const todas = locacoesCompletas.get(base.COD_PRODUTO) ?? [];
+            const selecionadas = new Set(
+              produtosDoGrupo
+                .map((p) => (p.LOCALIZACAO ?? '').toUpperCase().trim())
+                .filter(Boolean),
+            );
+            const faltantes = todas.filter((loc) => {
+              const key = loc.toUpperCase().trim();
+              // Fora se foi selecionada agora OU se já existe (contada ou pendente) em
+              // outra sessão ativa do mesmo produto/dia.
+              return !selecionadas.has(key) && !locacoesJaExistentes.has(key);
+            });
+
+            for (const loc of faltantes) {
+              const item = await tx.est_contagem_itens.create({
+                data: {
+                  identificador_item: targetIdentificador,
+                  contagem_cuid: grupoContagem,
+                  data: base.DATA,
+                  cod_produto: base.COD_PRODUTO,
+                  desc_produto: base.DESC_PRODUTO ?? '',
+                  mar_descricao: base.MAR_DESCRICAO,
+                  ref_fabricante: base.REF_FABRICANTE,
+                  ref_fornecedor: base.REF_FORNECEDOR,
+                  localizacao: loc,
+                  unidade: base.UNIDADE,
+                  aplicacoes: null,
+                  qtde_saida: 0,
+                  estoque: base.ESTOQUE,
+                  reserva: base.RESERVA,
+                  pendente: true,
+                  conferir: false,
+                },
+              });
+              itens.push(item);
+            }
+
+            if (faltantes.length > 0) {
+              pendencias.push({
+                cod_produto: base.COD_PRODUTO,
+                desc_produto: base.DESC_PRODUTO ?? '',
+                locacoes_pendentes: faltantes,
+              });
+            }
+          }
+        }
+
+        // ADOÇÃO DE PENDENTES: itens que outra avulsa deixou aguardando entram nesta
+        // sessão. O item MUDA de sessão (contagem_cuid novo) mas conserva data e
+        // identificador — assim a contagem feita aqui fecha a consolidação do
+        // produto/dia da sessão de origem.
+        if (ehAvulsa && Array.isArray(itens_pendentes_ids) && itens_pendentes_ids.length > 0) {
+          const adotaveis = await tx.est_contagem_itens.findMany({
+            where: {
+              id: { in: itens_pendentes_ids },
+              pendente: true,
+              logs: { none: {} },
             },
           });
-          itens.push(item);
+
+          for (const itemPendente of adotaveis) {
+            const adotado = await tx.est_contagem_itens.update({
+              where: { id: itemPendente.id },
+              data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
+            });
+            itens.push(adotado);
+          }
+
+          if (adotaveis.length < itens_pendentes_ids.length) {
+            console.log(
+              `[PENDENTES] ${itens_pendentes_ids.length - adotaveis.length} item(ns) não adotado(s): já contados, já adotados ou inexistentes.`,
+            );
+          }
         }
       } else {
         itens = itensExistentes;
@@ -378,7 +1173,9 @@ export class EstoqueSaidasRepository {
       return { ...contagem, itens };
     });
 
-    return contagemResult;
+    // `pendencias` alimenta o aviso da tela: "esses produtos têm locações que ficaram
+    // pendentes de contagem". Vazio na diária e quando o produto só tem uma locação.
+    return { ...contagemResult, pendencias };
   }
 
   async getContagensByUsuario(idUsuario: string) {
@@ -413,13 +1210,17 @@ export class EstoqueSaidasRepository {
       }
     });
 
-    // Buscar os itens separadamente usando contagem_cuid
+    // Buscar os itens separadamente usando contagem_cuid.
+    // Itens PENDENTES ficam fora da lista do contador: são locações que a avulsa
+    // deliberadamente deixou para uma contagem complementar — quem os conta é a
+    // sessão que os adotar (aí deixam de ser pendentes e aparecem).
     const contagensComItens = await Promise.all(
       contagens.map(async (contagem) => {
         if (contagem.contagem_cuid) {
           const itens = await this.prisma.est_contagem_itens.findMany({
             where: {
-              contagem_cuid: contagem.contagem_cuid
+              contagem_cuid: contagem.contagem_cuid,
+              pendente: false
             },
             orderBy: {
               cod_produto: 'asc'
@@ -560,57 +1361,71 @@ export class EstoqueSaidasRepository {
     console.log(`[DEBUG] updateItemConferir: Divergencia Final? ${temDivergenciaNumerica} (RealSum=${realSum} vs EstoqueRef=${estoqueRealtime})`);
 
     // Se o usuário mandou "conferir: false", mas matematicamente tem divergência,
-    // precisamos ter cuidado. 
+    // precisamos ter cuidado.
     // O sistema original forçava o Back a decidir.
 
     // --- LÓGICA DE VALIDAÇÃO HÍBRIDA (FRONT x BACK) ---
-    // 1. Buscar todos os itens que compõem este produto (mesmo identificador)
-    const groupItems = await this.prisma.est_contagem_itens.findMany({
-      where: {
-        identificador_item: identificador_item,
-        contagem_cuid: parentContagem?.contagem_cuid ?? ''
-      }
-    });
+    // O produto pode ter locações espalhadas por SESSÕES diferentes (pisos/CUIDs
+    // distintos, portanto identificador_item distinto). Por isso a validação olha o
+    // produto/dia inteiro — só assim "locação A certa + locação B certa" fecha com o
+    // estoque total do sistema.
+    const consolidado = await consolidarProdutoDia(
+      this.prisma,
+      contagemItem.cod_produto,
+      contagemItem.data,
+      { estoqueReferencia: estoqueRealtime },
+    );
+
+    const rodadaAtual = parentContagem?.contagem;
+    const totalLocacoes = consolidado?.locacoes.length ?? 1;
 
     let finalConferirValue = temDivergenciaNumerica; // Default: Back decide (segurança)
-    let trustFront = false;
+    let escopoUpdate: Prisma.est_contagem_itensWhereInput = { identificador_item: identificador_item };
 
-    if (groupItems.length <= 1) {
+    if (totalLocacoes <= 1) {
       // CASO 1: Locação Única -> CONFIA NO FRONT
       // O usuário sabe o que está vendo. Se ele marcou que tem divergência, tem. Se não, não.
-      trustFront = true;
-    } else {
-      // CASO 2: Multilocação
-      // Verificamos se TODOS os locais já foram contados nesta rodada.
-      // Se ainda falta contagem em algum local, não temos como validar o total,
-      // então confiamos no status provisório que o front mandar.
-
-      const countedItemIds = new Set(logsRelevantes.map(l => l.item_id));
-      const allLocationsCounted = groupItems.every(item => countedItemIds.has(item.id));
-
-      if (!allLocationsCounted) {
-        // Ainda não acabou de contar todos os locais -> CONFIA NO FRONT (Status Provisório)
-        trustFront = true;
-      } else {
-        // Todos contados -> VALIDAÇÃO RIGOROSA DO BACK
-        // Somamos tudo e vemos se bate com o estoque total.
-        trustFront = false;
-      }
-    }
-
-    if (trustFront) {
       console.log(`[DEBUG] HybridValidation: Trusting Frontend value=${conferir}`);
       finalConferirValue = conferir;
+    } else if (consolidado?.correto) {
+      // CASO 2: Multilocação já fechada com o estoque (uma rodada INTEIRA bateu — a
+      // validação nunca mistura rodadas) -> NENHUMA locação segue para as próximas
+      // contagens, inclusive as que estão em outras sessões.
+      console.log(`[DEBUG] HybridValidation: Produto fechado -> ${consolidado.motivo}`);
+      finalConferirValue = false;
+      escopoUpdate = { id: { in: consolidado.itens_ids } };
+    } else if (consolidado && rodadaAtual && this.rodadaCoberta(consolidado, rodadaAtual)) {
+      // CASO 3: Multilocação com TODAS as locações já contadas nesta rodada e a soma não
+      // fechou -> divergência confirmada pelo BACK.
+      console.log(`[DEBUG] HybridValidation: Enforcing Backend value=true (soma ${consolidado.rodadas[rodadaAtual as Rodada].total} x estoque ${consolidado.estoque_referencia})`);
+      finalConferirValue = true;
+    } else if (consolidado?.status === 'aguardando_pendentes') {
+      // CASO 3b: Avulsa parcial com o escopo todo contado — só faltam as locações
+      // PENDENTES (deixadas de propósito para outra contagem). A soma parcial não pode
+      // ser comparada ao estoque total, então não há divergência a marcar.
+      console.log(`[DEBUG] HybridValidation: Aguardando pendentes -> ${consolidado.motivo}`);
+      finalConferirValue = false;
     } else {
-      console.log(`[DEBUG] HybridValidation: Enforcing Backend value=${temDivergenciaNumerica}`);
-      finalConferirValue = temDivergenciaNumerica;
+      // CASO 4: Ainda falta contar alguma locação (possivelmente em outra sessão).
+      // Sem o total não dá para validar -> CONFIA NO FRONT (status provisório).
+      console.log(`[DEBUG] HybridValidation: Locações pendentes, trusting Frontend value=${conferir}`);
+      finalConferirValue = conferir;
     }
 
     // ATUALIZAÇÃO EM MASSA:
     const updated = await this.prisma.est_contagem_itens.updateMany({
-      where: { identificador_item: identificador_item },
+      where: escopoUpdate,
       data: { conferir: finalConferirValue },
     });
+
+    // Se o produto fechou, as outras sessões que já haviam sido liberadas para a 2ª/3ª
+    // contagem por causa dele não têm mais o que recontar.
+    if (consolidado?.correto) {
+      for (const cuidIrmao of consolidado.cuids) {
+        if (cuidIrmao === parentContagem?.contagem_cuid) continue;
+        await this.revogarLiberacoesSemDivergencia(cuidIrmao);
+      }
+    }
 
     // Retorna um dos itens atualizados
     return await this.prisma.est_contagem_itens.findFirst({
@@ -618,27 +1433,99 @@ export class EstoqueSaidasRepository {
     });
   }
 
+  /** true quando TODAS as locações do produto/dia foram contadas na rodada informada. */
+  private rodadaCoberta(consolidado: ConsolidadoProdutoDia, rodada: number): boolean {
+    if (rodada !== 1 && rodada !== 2 && rodada !== 3) return false;
+    return consolidado.rodadas[rodada as Rodada].cobertura_total;
+  }
+
+  /**
+   * "Chama de volta" as contagens 2/3 de uma sessão que foram liberadas por engano.
+   *
+   * Cenário: a sessão A concluiu ANTES de a sessão B contar a outra locação do mesmo
+   * produto. Somando só a locação de A a conta não fechava, então A foi liberada para a
+   * 2ª contagem. Quando B conta a outra locação e o produto fecha com o estoque, A não
+   * tem mais nada para recontar.
+   *
+   * Só revoga rodadas que ainda NÃO foram iniciadas (sem nenhum log) e nunca a 1ª
+   * contagem — trabalho já feito não é desfeito.
+   */
+  private async revogarLiberacoesSemDivergencia(contagem_cuid: string) {
+    if (!contagem_cuid) return;
+
+    const pendentes = await this.prisma.est_contagem_itens.count({
+      where: { contagem_cuid: contagem_cuid, conferir: true },
+    });
+
+    if (pendentes > 0) return;
+
+    const rodadasLiberadas = await this.prisma.est_contagem.findMany({
+      where: {
+        contagem_cuid: contagem_cuid,
+        contagem: { gt: 1 },
+        liberado_contagem: true,
+        status: 0,
+      },
+      select: { id: true, contagem: true, _count: { select: { logs: true } } },
+    });
+
+    const idsSemLogs = rodadasLiberadas.filter(r => r._count.logs === 0).map(r => r.id);
+    if (idsSemLogs.length === 0) return;
+
+    await this.prisma.est_contagem.updateMany({
+      where: { id: { in: idsSemLogs } },
+      data: { liberado_contagem: false },
+    });
+
+    console.log(`[DEBUG] revogarLiberacoes: CUID=${contagem_cuid} -> ${idsSemLogs.length} rodada(s) fechada(s) por não haver mais divergência.`);
+  }
+
   async getEstoqueProduto(codProduto: number, empresa: string = '3'): Promise<ConferirEstoqueResponseDto | null> {
     // Sanitização adicional
     if (!/^\d+$/.test(empresa)) {
       throw new BadRequestException('Empresa inválida');
     }
+    // O valor entra no literal Firebird: só inteiro passa.
+    if (!Number.isInteger(Number(codProduto))) {
+      throw new BadRequestException('Código de produto inválido');
+    }
 
-    // Monta o SQL que será passado DENTRO do OPENQUERY (dialeto Firebird)
+    return this.erpApi.comFallback(
+      async () => {
+        const linha = await this.erpApi.estoqueProduto(Number(codProduto), Number(empresa));
+        if (!linha) return null;
+        // Mesmas chaves que o driver devolvia (o Firebird responde em MAIÚSCULAS):
+        // quem consome lê `.ESTOQUE`, e o contrato não muda com a troca de caminho.
+        return {
+          PRO_CODIGO: Number(linha.PRO_CODIGO),
+          ESTOQUE: Number(linha.ESTOQUE_DISPONIVEL),
+        } as unknown as ConferirEstoqueResponseDto;
+      },
+      () => this.getEstoqueProdutoViaOpenQuery(codProduto, empresa),
+    );
+  }
+
+  /**
+   * A conferência pergunta produto a produto. Pela API, as chamadas unitárias
+   * que chegam juntas viram um único SELECT com IN do outro lado; por aqui,
+   * cada uma é uma ida ao Firebird.
+   */
+  private async getEstoqueProdutoViaOpenQuery(codProduto: number, empresa: string): Promise<ConferirEstoqueResponseDto | null> {
+
+    // ESTOQUE_DISPONIVEL é coluna de PRODUTOS: o saldo sai daqui direto.
+    //
+    // A versão anterior chegava nele por LANCTOS_ESTOQUE e MARCAS, e o efeito
+    // não era lentidão — era resposta faltando. Os dois joins eram INNER, então
+    // produto sem movimentação ou sem marca devolvia ZERO linhas, e quem chama
+    // interpreta null como "não consegui saber o estoque" e usa o snapshot
+    // antigo da contagem. O saldo aparecia desatualizado sem nenhum erro no log.
     const innerSql = [
       'SELECT',
-      '    PRO.pro_codigo,',
-      '    MAX(PRO.estoque_disponivel) AS ESTOQUE',
-      'FROM lanctos_estoque EST',
-      'JOIN PRODUTOS PRO',
-      '    ON (EST.pro_codigo = PRO.pro_codigo)',
-      '    AND (EST.empresa = PRO.empresa)',
-      'JOIN MARCAS MC',
-      '    ON (MC.EMPRESA = PRO.EMPRESA)',
-      '    AND (MC.MAR_CODIGO = PRO.MAR_CODIGO)',
-      `WHERE EST.empresa = '${empresa}'`,
-      `    AND PRO.pro_codigo = ${codProduto}`,
-      'GROUP BY PRO.pro_codigo'
+      '    PRO.PRO_CODIGO,',
+      '    PRO.ESTOQUE_DISPONIVEL AS ESTOQUE',
+      'FROM PRODUTOS PRO',
+      `WHERE PRO.EMPRESA = '${empresa}'`,
+      `    AND PRO.PRO_CODIGO = ${codProduto}`,
     ].join('\n');
 
     // Escapa aspas simples para T-SQL
@@ -660,8 +1547,12 @@ export class EstoqueSaidasRepository {
     contagem_cuid: string,
     contagem: number,
     divergencia: boolean,
-    itensParaRevalidar: string[] = []
+    itensParaRevalidar: string[] = [],
+    data_fim?: string
   ) {
+    // Fim da contagem = clique em "Concluir". Usa o horário do dispositivo quando válido.
+    let dataFim = data_fim ? new Date(data_fim) : new Date();
+    if (isNaN(dataFim.getTime())) dataFim = new Date();
     // 0. Revalidação Seletiva de Itens Falhos
     if (itensParaRevalidar && itensParaRevalidar.length > 0) {
       console.log(`[DEBUG] Revalidando ${itensParaRevalidar.length} itens que falharam anteriormente...`);
@@ -687,17 +1578,18 @@ export class EstoqueSaidasRepository {
       }
     }
 
-    // Sempre trava a contagem atual (liberado_contagem = false)
+    // Sempre trava a contagem atual (liberado_contagem = false) e grava o fim.
     await this.prisma.est_contagem.updateMany({
       where: {
         contagem_cuid: contagem_cuid,
         contagem: contagem,
       },
-      data: { liberado_contagem: false },
+      data: { liberado_contagem: false, data_fim: dataFim },
     });
 
     // Se está na contagem 3, não há próxima para liberar
     if (contagem === 3) {
+      await this.reconciliarProdutosDaSessao(contagem_cuid);
       return await this.prisma.est_contagem.updateMany({
         where: {
           contagem_cuid: contagem_cuid,
@@ -707,98 +1599,14 @@ export class EstoqueSaidasRepository {
       });
     }
 
-    // Se divergência já for TRUE pelo frontend, segue normal.
-    // Mas se for FALSE, precisamos verificar se não há "falsos positivos" (itens pendentes marcados como verdes)
-    let temDivergenciaReal = divergencia;
+    // VALIDAÇÃO CONSOLIDADA (produto/dia, todas as locações de todas as sessões).
+    // O flag `divergencia` que vem do front enxerga apenas as locações desta sessão. Se o
+    // mesmo produto está em outro piso/sessão, essa visão é parcial nos dois sentidos:
+    //  - pode acusar divergência que a outra locação já resolveu (aí NÃO se libera nada);
+    //  - pode dar tudo certo aqui e faltar locação lá (aí a divergência continua valendo).
+    const { algumProdutoDivergente, temItens } = await this.reconciliarProdutosDaSessao(contagem_cuid);
 
-    if (!temDivergenciaReal) {
-      // Buscar itens para conferir se a soma bate
-      // Busca itens da contagem atual
-      // Precisamos dos LOGS também para somar
-      // Isso pode ser pesado, mas necessário para segurança.
-      const itens = await this.prisma.est_contagem_itens.findMany({
-        where: { contagem_cuid: contagem_cuid },
-      });
-
-      // Agrupar itens por código de produto
-      const itemsByProduct: Record<string, typeof itens> = {};
-      for (const item of itens) {
-        const key = String(item.cod_produto);
-        if (!itemsByProduct[key]) itemsByProduct[key] = [];
-        itemsByProduct[key].push(item);
-      }
-
-      // Iterar por CÓDIGO DE PRODUTO (Agrupamento)
-      for (const codProduto in itemsByProduct) {
-        const groupItems = itemsByProduct[codProduto];
-
-        // Se houver apenas 1 item e não tiver aplicação, segue lógica padrão individual
-        // Mas para garantir consistência, vamos usar a lógica de soma para tudo.
-
-        // 1. Calcular o Estoque de Referência
-        // Como agora o updateItemConferir ATUALIZA o campo estoque com o valor da OpenQuery no momento do salvo,
-        // podemos confiar no valor do banco, sem precisar fazer fetch de novo aqui.
-        // Isso atende o requisito: "a busca deve ser feita sempre que for clicado em salvar no item no front"
-        const estoqueRef = groupItems[0].estoque || 0;
-
-        // 2. Calcular a Soma Total Contada para este Produto (somando logs de todos os itens do grupo)
-        let grandTotalContado = 0;
-
-        // Precisamos dos IDs de contagem para filtrar logs (Ajuste anterior: contagemIds)
-        const contagemRows = await this.prisma.est_contagem.findMany({
-          where: { contagem_cuid: contagem_cuid, contagem: contagem },
-          select: { id: true }
-        });
-        const contagemIds = contagemRows.map(c => c.id);
-
-        if (contagemIds.length > 0) {
-          for (const item of groupItems) {
-            // Buscar logs para este item
-            const logs = await this.prisma.est_contagem_log.findMany({
-              where: { identificador_item: item.identificador_item }, // Logs são por item
-            });
-
-            // Filtrar logs apenas da contagem atual (Ids encontrados)
-            const activeLogs = logs.filter(l => contagemIds.includes(l.contagem_id));
-
-            // Soma simples dos logs deste item
-            // FIX: Evita somar logs duplicados caso itemsByProduct tenha mais de 1 item (locações diferentes)
-            // mas que apontam para o mesmo identificador_item.
-            // Como estamos iterando por GROUP ITEMS, se tivermos 2 itens com mesmo identificador,
-            // vamos processar 2 vezes.
-            // A solução é iterar por "Identificador Item Único" dentro do grupo de produtos.
-            const uniqueIdentifiers = [...new Set(groupItems.map(i => i.identificador_item).filter(id => id !== null))];
-
-            grandTotalContado = 0; // Reinicia para calcular corretamente baseados nos unicos
-
-            for (const idIdentificador of uniqueIdentifiers) {
-              const logs = await this.prisma.est_contagem_log.findMany({
-                where: { identificador_item: idIdentificador },
-              });
-              // Filtra logs apenas da contagem atual
-              const activeLogs = logs.filter(l => contagemIds.includes(l.contagem_id));
-              const partSum = activeLogs.reduce((acc, log) => acc + log.contado, 0);
-              grandTotalContado += partSum;
-            }
-
-            // Break loop para não repetir soma para cada item do grupo, já calculamos o total do PRODUTO.
-            break;
-          }
-
-          // 3. Comparar Soma Total x Estoque Total
-          if (grandTotalContado !== estoqueRef) {
-            temDivergenciaReal = true;
-
-            // ATUALIZAR TODOS OS ITENS DO GRUPO
-            const itemIds = groupItems.map(i => i.id);
-            await this.prisma.est_contagem_itens.updateMany({
-              where: { id: { in: itemIds } },
-              data: { conferir: true }
-            });
-          }
-        }
-      }
-    }
+    const temDivergenciaReal = temItens ? algumProdutoDivergente : divergencia;
 
     if (temDivergenciaReal) {
       console.log(`[DEBUG] updateLiberadoContagem: CUID=${contagem_cuid}, Contagem=${contagem} (${typeof contagem}), Divergencia=${divergencia}`);
@@ -853,13 +1661,130 @@ export class EstoqueSaidasRepository {
       return contagemAtualizada;
     }
 
-    // Se não há divergência, só trava o atual e não libera o próximo
+    // Se não há divergência, só trava o atual e não libera o próximo.
+    // Se alguma rodada seguinte tinha sido liberada antes (por uma conclusão anterior que
+    // ainda não enxergava a outra locação), ela é fechada aqui.
+    await this.revogarLiberacoesSemDivergencia(contagem_cuid);
+
     return await this.prisma.est_contagem.findFirst({
       where: {
         contagem_cuid: contagem_cuid,
         contagem: contagem,
       },
     });
+  }
+
+  /**
+   * Reavalia todos os produtos de uma sessão olhando o produto/dia INTEIRO — todas as
+   * locações, inclusive as que estão em outras sessões (outro piso, outro CUID).
+   *
+   * - Produto que fechou com o estoque: `conferir = false` em TODAS as locações (as desta
+   *   sessão e as das outras), e as rodadas que as outras sessões tinham aberto por causa
+   *   dele são fechadas se ainda não foram iniciadas.
+   * - Produto que não fechou: `conferir = true` nas locações desta sessão, que segue para
+   *   a próxima contagem.
+   */
+  private async reconciliarProdutosDaSessao(
+    contagem_cuid: string,
+  ): Promise<{ algumProdutoDivergente: boolean; temItens: boolean }> {
+    const itens = await this.prisma.est_contagem_itens.findMany({
+      where: { contagem_cuid: contagem_cuid },
+      select: { id: true, cod_produto: true, data: true },
+    });
+
+    if (itens.length === 0) {
+      return { algumProdutoDivergente: false, temItens: false };
+    }
+
+    // Agrupa as locações desta sessão por produto/dia (a chave usada na consolidação).
+    const grupos = new Map<string, { cod_produto: number; data: Date; itensIds: string[] }>();
+    for (const item of itens) {
+      const chave = `${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`;
+      const grupo = grupos.get(chave);
+      if (grupo) grupo.itensIds.push(item.id);
+      else grupos.set(chave, { cod_produto: item.cod_produto, data: item.data, itensIds: [item.id] });
+    }
+
+    let algumProdutoDivergente = false;
+    const cuidsIrmaos = new Set<string>();
+
+    for (const grupo of grupos.values()) {
+      const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data);
+      if (!consolidado) continue;
+
+      if (consolidado.correto) {
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: consolidado.itens_ids } },
+          data: { conferir: false },
+        });
+
+        for (const cuid of consolidado.cuids) {
+          if (cuid !== contagem_cuid) cuidsIrmaos.add(cuid);
+        }
+
+        console.log(`[DEBUG] reconciliar: produto ${grupo.cod_produto} OK -> ${consolidado.motivo}`);
+      } else if (consolidado.status === 'aguardando_pendentes') {
+        // Avulsa parcial: as locações do escopo foram contadas, mas o produto tem
+        // locações pendentes sem contagem. A soma é parcial por definição — não é
+        // divergência e o produto NÃO segue para a 2ª/3ª contagem. Desmarca `conferir`
+        // (o app pode ter marcado provisoriamente, já que ele só enxerga a soma parcial).
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: grupo.itensIds } },
+          data: { conferir: false },
+        });
+
+        console.log(`[DEBUG] reconciliar: produto ${grupo.cod_produto} PENDENTE -> ${consolidado.motivo}`);
+      } else {
+        algumProdutoDivergente = true;
+        await this.prisma.est_contagem_itens.updateMany({
+          where: { id: { in: grupo.itensIds } },
+          data: { conferir: true },
+        });
+      }
+    }
+
+    for (const cuidIrmao of cuidsIrmaos) {
+      await this.revogarLiberacoesSemDivergencia(cuidIrmao);
+    }
+
+    return { algumProdutoDivergente, temItens: true };
+  }
+
+  /**
+   * Itens PENDENTES disponíveis para adoção: locações que avulsas anteriores deixaram
+   * fora do escopo, ainda sem nenhuma contagem, de sessões ativas. É a lista que a tela
+   * "buscar pendentes de outra avulsa" mostra.
+   */
+  async getItensPendentes() {
+    const itens = await this.prisma.est_contagem_itens.findMany({
+      where: { pendente: true, logs: { none: {} } },
+      orderBy: [{ cod_produto: 'asc' }],
+    });
+
+    if (itens.length === 0) return [];
+
+    // Só valem pendências de sessão ativa; o nome da contagem de origem (coluna
+    // 'piso') vai junto para o usuário saber de onde a pendência veio.
+    const cuids = [...new Set(itens.map(i => i.contagem_cuid))];
+    const sessoes = await this.prisma.est_contagem.findMany({
+      where: { contagem_cuid: { in: cuids }, status: 0, tipo: 2 },
+      select: { contagem_cuid: true, piso: true, created_at: true },
+    });
+
+    const sessaoPorCuid = new Map<string, { piso: string | null; created_at: Date }>();
+    for (const s of sessoes) {
+      if (s.contagem_cuid && !sessaoPorCuid.has(s.contagem_cuid)) {
+        sessaoPorCuid.set(s.contagem_cuid, { piso: s.piso, created_at: s.created_at });
+      }
+    }
+
+    return itens
+      .filter(i => sessaoPorCuid.has(i.contagem_cuid))
+      .map(i => ({
+        ...i,
+        contagem_origem: sessaoPorCuid.get(i.contagem_cuid)?.piso ?? null,
+        criada_em: sessaoPorCuid.get(i.contagem_cuid)?.created_at ?? null,
+      }));
   }
 
   async getContagensByGrupo(contagem_cuid: string) {
@@ -975,7 +1900,8 @@ export class EstoqueSaidasRepository {
     };
 
     if (piso) {
-      whereClause.piso = piso;
+      // 'piso' guarda o nome da contagem; busca por parte do nome (case-insensitive).
+      whereClause.piso = { contains: piso, mode: 'insensitive' };
     }
 
     if (data) {
@@ -1134,13 +2060,22 @@ export class EstoqueSaidasRepository {
       const idsParaExcluir = grupoContagens.map(c => c.id);
 
       if (idsParaExcluir.length > 0) {
-        return await this.prisma.est_contagem.updateMany({
+        const resultado = await this.prisma.est_contagem.updateMany({
           where: { id: { in: idsParaExcluir } },
           data: {
             liberado_contagem: false,
             status: 1,
           }
         });
+
+        // O grupo excluído some da consolidação — mas as sessões que compartilhavam
+        // produto/dia com ele podem ter sido dadas como divergentes por causa das
+        // locações dele (ex.: grupo duplicado por duplo-clique: os itens sem contagem
+        // do fantasma impediam qualquer rodada de fechar). Reavalia essas sessões para
+        // limpar `conferir` e recolher rodadas liberadas sem necessidade.
+        await this.reavaliarSessoesVizinhas(contagemAlvo.contagem_cuid);
+
+        return resultado;
       }
 
     } else {
@@ -1159,6 +2094,62 @@ export class EstoqueSaidasRepository {
     }
 
     return { count: 0, message: "Nenhuma contagem excluída" };
+  }
+
+  /**
+   * Reavalia as sessões que compartilhavam produto/dia com um grupo recém-excluído.
+   * Para cada vizinha ativa: reconsolida os produtos (conferir volta a refletir a
+   * realidade sem as locações do grupo excluído) e recolhe rodadas liberadas que
+   * ficaram sem divergência para justificá-las.
+   */
+  private async reavaliarSessoesVizinhas(contagemCuidExcluido: string | null) {
+    if (!contagemCuidExcluido) return;
+
+    const itensDoGrupo = await this.prisma.est_contagem_itens.findMany({
+      where: { contagem_cuid: contagemCuidExcluido },
+      select: { cod_produto: true, data: true },
+    });
+    if (itensDoGrupo.length === 0) return;
+
+    // Produto/dia distintos do grupo excluído.
+    const chaves = new Map<string, { cod: number; ini: Date; fim: Date }>();
+    for (const item of itensDoGrupo) {
+      const dia = item.data.toISOString().slice(0, 10);
+      const chave = `${item.cod_produto}-${dia}`;
+      if (chaves.has(chave)) continue;
+      const ini = new Date(item.data);
+      ini.setUTCHours(0, 0, 0, 0);
+      const fim = new Date(item.data);
+      fim.setUTCHours(23, 59, 59, 999);
+      chaves.set(chave, { cod: item.cod_produto, ini, fim });
+    }
+
+    const cuidsVizinhos = new Set<string>();
+    for (const { cod, ini, fim } of chaves.values()) {
+      const rows = await this.prisma.est_contagem_itens.findMany({
+        where: {
+          cod_produto: cod,
+          data: { gte: ini, lte: fim },
+          NOT: { contagem_cuid: contagemCuidExcluido },
+        },
+        select: { contagem_cuid: true },
+        distinct: ['contagem_cuid'],
+      });
+      for (const r of rows) {
+        if (r.contagem_cuid) cuidsVizinhos.add(r.contagem_cuid);
+      }
+    }
+
+    for (const cuid of cuidsVizinhos) {
+      try {
+        await this.reconciliarProdutosDaSessao(cuid);
+        await this.revogarLiberacoesSemDivergencia(cuid);
+        console.log(`[EXCLUSAO] Sessão vizinha ${cuid} reavaliada após exclusão de ${contagemCuidExcluido}.`);
+      } catch (e) {
+        // Reavaliação é saneamento: falhar aqui não pode desfazer a exclusão.
+        console.error(`[EXCLUSAO] Falha ao reavaliar sessão vizinha ${cuid}`, e);
+      }
+    }
   }
 
   async updateContagemGrupo(
@@ -1223,6 +2214,37 @@ export class EstoqueSaidasRepository {
     });
   }
 
+  /**
+   * Grava o início da contagem (data_inicio) na PRIMEIRA quantidade contada.
+   * Regras:
+   *  - só grava se ainda estiver vazio; OU
+   *  - se o horário informado for MAIS ANTIGO que o já gravado (sync fora de ordem).
+   * Usa o horário real do dispositivo (client_time) quando válido; senão, now().
+   */
+  private async marcarInicioContagem(contagemId: string, clientTime?: string) {
+    try {
+      const contagem = await this.prisma.est_contagem.findUnique({
+        where: { id: contagemId },
+        select: { data_inicio: true },
+      });
+      if (!contagem) return;
+
+      let momento = clientTime ? new Date(clientTime) : new Date();
+      if (isNaN(momento.getTime())) momento = new Date();
+
+      const inicioAtual = contagem.data_inicio;
+      if (!inicioAtual || momento < inicioAtual) {
+        await this.prisma.est_contagem.update({
+          where: { id: contagemId },
+          data: { data_inicio: momento },
+        });
+      }
+    } catch (e) {
+      // Início é métrica auxiliar (para KPIs); nunca deve quebrar o registro do log.
+      console.error('[marcarInicioContagem] Falha ao gravar data_inicio', e);
+    }
+  }
+
   async createLog(createLogData: {
     contagem_id: string;
     usuario_id: string;
@@ -1230,7 +2252,14 @@ export class EstoqueSaidasRepository {
     estoque: number;
     contado: number;
     identificador_item?: string;
+    client_time?: string;
   }) {
+    // Marca o INÍCIO da contagem no momento da PRIMEIRA quantidade contada.
+    // Como o app é offline-first, usamos o horário REAL do dispositivo (client_time)
+    // — que pode ser bem anterior ao horário de sincronização. Só grava se ainda não
+    // houver início, ou se este log for mais antigo (sync fora de ordem).
+    await this.marcarInicioContagem(createLogData.contagem_id, createLogData.client_time);
+
     // 1. Tenta encontrar um log existente específico para este USUÁRIO nesta CONTAGEM e ITEM
     const existingLog = await this.prisma.est_contagem_log.findFirst({
       where: {

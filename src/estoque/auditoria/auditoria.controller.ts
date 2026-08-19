@@ -11,6 +11,18 @@ export class AuditoriaController {
         return this.service.getItensParaAuditoria(data, piso);
     }
 
+    /** Contagens avulsas para o seletor da auditoria (com resumo de divergências/pendências). */
+    @Get('avulsas')
+    async listarAvulsas() {
+        return this.service.listarAvulsasParaAuditoria();
+    }
+
+    /** Auditoria de uma contagem avulsa específica, consolidando as sessões vinculadas. */
+    @Get('pendentes-avulsa')
+    async getItensParaAuditoriaAvulsa(@Query('cuid') cuid: string) {
+        return this.service.getItensParaAuditoriaAvulsa(cuid);
+    }
+
     @Post()
     async saveAuditoria(
         @Body() dto: CreateAuditoriaDto,
