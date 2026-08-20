@@ -1,11 +1,13 @@
 // src/main.ts
 import { NestFactory } from '@nestjs/core';
+import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { AppModule } from './app.module';
-import helmet from 'helmet';
+import fastifyHelmet from '@fastify/helmet';
+import fastifyCookie from '@fastify/cookie';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import * as bodyParser from 'body-parser';
-// (opcional, mas recomendado quando usa cookies/autenticação)
-import cookieParser from 'cookie-parser';
+import type { FastifyReply, FastifyRequest } from 'fastify';
+
+const BODY_LIMIT = 25 * 1024 * 1024; // 25mb
 
 function parseOrigins(env?: string): (string | RegExp)[] {
   if (!env) return [];
@@ -33,30 +35,56 @@ function isAllowedOrigin(origin: string | undefined, allowed: (string | RegExp)[
   return false;
 }
 
+// Reproduz o mount-path do Express: app.use(['/docs', '/docs-json'], ...)
+function isDocsPath(url: string): boolean {
+  const path = url.split('?')[0];
+  return (
+    path === '/docs' ||
+    path.startsWith('/docs/') ||
+    path === '/docs-json' ||
+    path.startsWith('/docs-json/')
+  );
+}
+
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
-
-  // Se estiver atrás de proxy reverso (Nginx/Traefik) e usar cookies Secure, habilite:
-  // app.set('trust proxy', 1);
-
-  app.use(cookieParser());
-
-  app.use(
-    helmet({
-      contentSecurityPolicy: false,     // necessário para swagger-ui
-      crossOriginEmbedderPolicy: false, // evita bloqueio de assets
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    new FastifyAdapter({
+      bodyLimit: BODY_LIMIT,
+      // Express trata /rota e /rota/ como a mesma coisa; o Fastify não trata por padrão.
+      ignoreTrailingSlash: true,
     }),
+    { bufferLogs: true },
   );
 
-  app.use(['/docs', '/docs-json'], (req, res, next) => {
+  // Se estiver atrás de proxy reverso (Nginx/Traefik) e usar cookies Secure, habilite
+  // trustProxy: true nas opções do FastifyAdapter acima.
+
+  await app.register(fastifyCookie);
+
+  await app.register(fastifyHelmet, {
+    contentSecurityPolicy: false,     // necessário para swagger-ui
+    crossOriginEmbedderPolicy: false, // evita bloqueio de assets
+  });
+
+  // Substitui bodyParser.json/urlencoded: o FastifyAdapter do Nest registra os parsers
+  // de 'application/json' e 'application/x-www-form-urlencoded' sozinho, ambos herdando
+  // o bodyLimit definido acima (fastify-adapter.js: registerJson/UrlencodedContentParser).
+
+  const fastify = app.getHttpAdapter().getInstance();
+
+  fastify.addHook('onRequest', (req: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => {
+    if (!isDocsPath(req.url)) return done();
+
     const authHeader = req.headers.authorization;
 
     const user = 'admin';
     const password = 'Ac@2025acesso';
 
     if (!authHeader || !authHeader.startsWith('Basic ')) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="Swagger"');
-      return res.status(401).send('Autenticação necessária');
+      reply.header('WWW-Authenticate', 'Basic realm="Swagger"');
+      reply.status(401).send('Autenticação necessária');
+      return;
     }
 
     const base64Credentials = authHeader.split(' ')[1];
@@ -65,11 +93,12 @@ async function bootstrap() {
     const [inputUser, inputPassword] = credentials.split(':');
 
     if (inputUser !== user || inputPassword !== password) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="Swagger"');
-      return res.status(401).send('Usuário ou senha inválidos');
+      reply.header('WWW-Authenticate', 'Basic realm="Swagger"');
+      reply.status(401).send('Usuário ou senha inválidos');
+      return;
     }
 
-    next();
+    done();
   });
 
   const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN);
@@ -100,15 +129,6 @@ async function bootstrap() {
     exposedHeaders: ['Content-Disposition'],
     maxAge: 86400, // cache do preflight por 1 dia
   });
-
-  // Garante Vary: Origin (útil se usar origin dinâmico/função)
-  app.use((req, res, next) => {
-    res.setHeader('Vary', 'Origin');
-    next();
-  });
-
-  app.use(bodyParser.json({ limit: '25mb' }));
-  app.use(bodyParser.urlencoded({ limit: '25mb', extended: true }));
 
   // (opcional) prefixo global
   // app.setGlobalPrefix('api');

@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { S3Service } from './s3.service';
+import { S3Service, UploadedFile } from './s3.service';
 
 // Mock do AWS S3
 const mockS3Client = {
@@ -47,7 +47,7 @@ describe('S3Service', () => {
         originalname: 'teste.jpg',
         mimetype: 'image/jpeg',
         size: 1024,
-      } as Express.Multer.File;
+      } as UploadedFile;
 
       const mockUploadResult = {
         ETag: '"abc123"',
@@ -75,7 +75,7 @@ describe('S3Service', () => {
           originalname: 'teste.jpg',
           mimetype: 'image/jpeg',
           size: 1024,
-        } as Express.Multer.File;
+        } as UploadedFile;
   
         const uploadFileSpy = jest.spyOn(service as any, 'uploadFile').mockRejectedValue(new Error('Erro no upload S3'));
   
