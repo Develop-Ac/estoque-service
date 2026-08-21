@@ -63,17 +63,23 @@ export class EstoqueSaidasService {
     try {
       const result = await this.repo.createContagem(createContagemDto);
 
-      await fetch('http://log-service.acacessorios.local/log', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          usuario: createContagemDto.usuario,
-          setor: 'Compras',
-          tela: 'Comparativo',
-          acao: 'Create',
-          descricao: `Criou contagem do colaborador ${createContagemDto.colaborador} com ${createContagemDto.produtos.length} produtos.`,
-        }),
-      });
+      // Auditoria é acessória: a contagem já está gravada — falha no log-service
+      // não pode transformar a criação num erro para quem chamou.
+      try {
+        await fetch('http://log-service.acacessorios.local/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            usuario: createContagemDto.usuario,
+            setor: 'Compras',
+            tela: 'Comparativo',
+            acao: 'Create',
+            descricao: `Criou contagem do colaborador ${createContagemDto.colaborador} com ${createContagemDto.produtos.length} produtos.`,
+          }),
+        });
+      } catch (logError) {
+        console.error('Falha ao registrar auditoria da contagem no log-service:', logError);
+      }
 
       return result;
     } catch (error) {

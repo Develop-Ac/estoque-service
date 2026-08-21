@@ -810,28 +810,45 @@ export class EstoqueSaidasRepository {
 
 
   /**
-   * Locações conhecidas de um produto no cadastro do ERP (explodidas pelas mesmas
-   * regras da busca da avulsa). Usada para descobrir as locações que ficaram FORA do
-   * escopo de uma avulsa parcial. Falha aqui não pode derrubar a criação da contagem:
-   * devolve null e a contagem nasce sem pendências (comportamento antigo).
+   * Locações conhecidas de um LOTE de produtos no cadastro do ERP (explodidas pelas
+   * mesmas regras da busca da avulsa). Usada para descobrir as locações que ficaram
+   * FORA do escopo de uma avulsa parcial.
+   *
+   * A busca é em lotes com IN: uma avulsa grande tem centenas de produtos e uma ida
+   * ao ERP por produto não termina dentro do tempo da requisição. Falha num lote não
+   * pode derrubar a criação da contagem: os produtos dele apenas ficam sem pendências.
    */
-  private async buscarLocacoesDoProduto(codProduto: number, empresa = '3'): Promise<string[] | null> {
-    try {
-      const rows = await this.fetchProdutosPorFiltro({
-        empresa,
-        cod_produto: codProduto,
-        somente_com_saldo: false,
-      });
-      const locs = new Set<string>();
-      for (const row of rows) {
-        const loc = this.toUtf8Text((row as any).LOCALIZACAO)?.trim();
-        if (loc) locs.add(loc);
+  private async buscarLocacoesDosProdutos(codigos: number[], empresa = '3'): Promise<Map<number, string[]>> {
+    const mapa = new Map<number, string[]>();
+    // O literal IN do Firebird aceita até ~1500 valores; 300 mantém folga e limita o
+    // tamanho de cada resposta.
+    const TAMANHO_LOTE = 300;
+
+    for (let i = 0; i < codigos.length; i += TAMANHO_LOTE) {
+      const lote = codigos.slice(i, i + TAMANHO_LOTE);
+      try {
+        const rows = await this.fetchProdutosPorFiltro({
+          empresa,
+          cod_produtos: lote,
+          somente_com_saldo: false,
+        });
+        for (const row of rows) {
+          const cod = Number((row as any).COD_PRODUTO);
+          const loc = this.toUtf8Text((row as any).LOCALIZACAO)?.trim();
+          if (!Number.isFinite(cod) || !loc) continue;
+          const locs = mapa.get(cod);
+          if (!locs) mapa.set(cod, [loc]);
+          else if (!locs.includes(loc)) locs.push(loc);
+        }
+      } catch (e) {
+        console.error(
+          `[PENDENTES] Falha ao buscar locações do lote de ${lote.length} produtos; contagem segue sem pendências para eles.`,
+          e,
+        );
       }
-      return [...locs];
-    } catch (e) {
-      console.error(`[PENDENTES] Falha ao buscar locações do produto ${codProduto}; contagem segue sem pendências para ele.`, e);
-      return null;
     }
+
+    return mapa;
   }
 
   async createContagem(createContagemDto: CreateContagemDto) {
@@ -930,10 +947,8 @@ export class EstoqueSaidasRepository {
       });
       if (jaTemItens === 0) {
         const codigos = [...new Set(produtosSanitizados.map(p => p.COD_PRODUTO).filter(c => c > 0))];
-        for (const cod of codigos) {
-          const locs = await this.buscarLocacoesDoProduto(cod);
-          if (locs) locacoesCompletas.set(cod, locs);
-        }
+        const porProduto = await this.buscarLocacoesDosProdutos(codigos);
+        for (const [cod, locs] of porProduto) locacoesCompletas.set(cod, locs);
       }
     }
 
@@ -982,28 +997,94 @@ export class EstoqueSaidasRepository {
           else gruposPorProduto.set(chaveBase, [produto]);
         }
 
-        // Criar os itens associados ao contagem_cuid — um identificador por grupo.
+        // Uma avulsa grande tem CENTENAS de grupos: as verificações por grupo
+        // (identificador em uso, itens do mesmo produto/dia em outras sessões) saem
+        // em consultas ÚNICAS antes do laço, e os INSERTs são acumulados num único
+        // createMany depois dele. Com uma consulta por grupo, 1300 itens estouravam
+        // o tempo limite da transação e nada era salvo.
+        const chaves = [...gruposPorProduto.keys()];
+        const identsEmUso = new Set(
+          (await tx.est_contagem_itens.findMany({
+            where: { identificador_item: { in: chaves } },
+            select: { identificador_item: true },
+            distinct: ['identificador_item'],
+          })).map((r) => r.identificador_item),
+        );
+
+        // Itens que os produtos/dia do payload já têm em OUTRAS sessões (avulsa):
+        // busca única cobrindo o intervalo de datas; o recorte por produto/dia usa a
+        // mesma chave `${cod}-${yyyy-mm-dd}` do agrupamento acima.
+        type ItemExistente = {
+          id: string;
+          localizacao: string | null;
+          pendente: boolean;
+          contagem_cuid: string;
+          logs: { id: string }[];
+        };
+        const existentesPorGrupo = new Map<string, ItemExistente[]>();
+        const cuidsAtivos = new Set<string>();
+        if (ehAvulsa && gruposPorProduto.size > 0) {
+          let minIni: Date | null = null;
+          let maxFim: Date | null = null;
+          for (const grupo of gruposPorProduto.values()) {
+            const ini = new Date(grupo[0].DATA);
+            ini.setUTCHours(0, 0, 0, 0);
+            const fim = new Date(grupo[0].DATA);
+            fim.setUTCHours(23, 59, 59, 999);
+            if (!minIni || ini < minIni) minIni = ini;
+            if (!maxFim || fim > maxFim) maxFim = fim;
+          }
+          const codigosGrupos = [...new Set([...gruposPorProduto.values()].map((g) => g[0].COD_PRODUTO))];
+
+          const existentesTodos = await tx.est_contagem_itens.findMany({
+            where: {
+              cod_produto: { in: codigosGrupos },
+              data: { gte: minIni!, lte: maxFim! },
+            },
+            select: {
+              id: true, localizacao: true, pendente: true, contagem_cuid: true,
+              cod_produto: true, data: true, logs: { select: { id: true }, take: 1 },
+            },
+          });
+
+          if (existentesTodos.length > 0) {
+            const cuidsExistentes = [...new Set(existentesTodos.map((e) => e.contagem_cuid))];
+            const sessoesAtivas = await tx.est_contagem.findMany({
+              where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
+              select: { contagem_cuid: true },
+            });
+            for (const s of sessoesAtivas) {
+              if (s.contagem_cuid) cuidsAtivos.add(s.contagem_cuid);
+            }
+
+            for (const e of existentesTodos) {
+              const chave = `${e.cod_produto}-${e.data.toISOString().slice(0, 10)}`;
+              const doGrupo = existentesPorGrupo.get(chave);
+              const registro = {
+                id: e.id, localizacao: e.localizacao, pendente: e.pendente,
+                contagem_cuid: e.contagem_cuid, logs: e.logs,
+              };
+              if (doGrupo) doGrupo.push(registro);
+              else existentesPorGrupo.set(chave, [registro]);
+            }
+          }
+        }
+
+        // INSERTs acumulados (itens selecionados + pendentes) para um createMany só.
+        const paraCriar: Prisma.est_contagem_itensCreateManyInput[] = [];
+
         for (const [chaveBase, produtosDoGrupo] of gruposPorProduto) {
           // Encontra uma versão de identificador ainda NÃO usada por outra sessão de
           // contagem do mesmo produto/dia (evita colisão/mistura de logs entre sessões).
           let targetIdentificador = chaveBase;
-          let version = 1;
-          while (true) {
-            const usageCount = await tx.est_contagem_itens.count({
-              where: { identificador_item: targetIdentificador }
-            });
-
-            if (usageCount === 0) {
-              // Identificador livre para esta sessão.
-              break;
-            }
-
-            // Já usado por uma sessão anterior. Tenta a próxima versão.
-            version++;
+          if (identsEmUso.has(chaveBase)) {
+            // Colisão (raro): sobe versões até achar uma livre.
+            let version = 2;
             targetIdentificador = `${chaveBase}-v${version}`;
-          }
-
-          if (version > 1) {
+            while ((await tx.est_contagem_itens.count({ where: { identificador_item: targetIdentificador } })) > 0) {
+              version++;
+              targetIdentificador = `${chaveBase}-v${version}`;
+            }
             console.log(`[AUTO-VERSION] Produto/dia ${chaveBase} já contado em outra sessão. Gerando versão: ${targetIdentificador}`);
           }
 
@@ -1012,39 +1093,16 @@ export class EstoqueSaidasRepository {
           // fantasma duplicado nunca seria contado e o produto ficaria aguardando para
           // sempre. Locação selecionada que já existe como fantasma é ADOTADA; fantasma
           // só nasce para locação que ainda não existe em lugar nenhum.
-          let fantasmaPorLocacao = new Map<string, { id: string }>();
+          const fantasmaPorLocacao = new Map<string, { id: string }>();
           const locacoesJaExistentes = new Set<string>();
           if (ehAvulsa) {
-            const base = produtosDoGrupo[0];
-            const diaIni = new Date(base.DATA);
-            diaIni.setUTCHours(0, 0, 0, 0);
-            const diaFim = new Date(base.DATA);
-            diaFim.setUTCHours(23, 59, 59, 999);
-
-            const existentes = await tx.est_contagem_itens.findMany({
-              where: {
-                cod_produto: base.COD_PRODUTO,
-                data: { gte: diaIni, lte: diaFim },
-              },
-              select: { id: true, localizacao: true, pendente: true, contagem_cuid: true, logs: { select: { id: true }, take: 1 } },
-            });
-
-            if (existentes.length > 0) {
-              const cuidsExistentes = [...new Set(existentes.map((e) => e.contagem_cuid))];
-              const sessoesAtivas = await tx.est_contagem.findMany({
-                where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
-                select: { contagem_cuid: true },
-              });
-              const cuidsAtivos = new Set(sessoesAtivas.map((s) => s.contagem_cuid));
-
-              for (const e of existentes) {
-                if (!cuidsAtivos.has(e.contagem_cuid)) continue;
-                const key = (e.localizacao ?? '').toUpperCase().trim();
-                if (!key) continue;
-                locacoesJaExistentes.add(key);
-                if (e.pendente && e.logs.length === 0) {
-                  fantasmaPorLocacao.set(key, { id: e.id });
-                }
+            for (const e of existentesPorGrupo.get(chaveBase) ?? []) {
+              if (!cuidsAtivos.has(e.contagem_cuid)) continue;
+              const key = (e.localizacao ?? '').toUpperCase().trim();
+              if (!key) continue;
+              locacoesJaExistentes.add(key);
+              if (e.pendente && e.logs.length === 0) {
+                fantasmaPorLocacao.set(key, { id: e.id });
               }
             }
           }
@@ -1056,34 +1114,30 @@ export class EstoqueSaidasRepository {
             if (fantasma) {
               // A locação selecionada já existe como pendente de outra avulsa do mesmo
               // dia: adota o item em vez de duplicar a locação no consolidado.
-              const adotado = await tx.est_contagem_itens.update({
+              await tx.est_contagem_itens.update({
                 where: { id: fantasma.id },
                 data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
               });
               fantasmaPorLocacao.delete(locKey);
-              itens.push(adotado);
               continue;
             }
 
-            const item = await tx.est_contagem_itens.create({
-              data: {
-                identificador_item: targetIdentificador,
-                contagem_cuid: grupoContagem,
-                data: produto.DATA, // salva apenas yyyy-mm-dd
-                cod_produto: produto.COD_PRODUTO,
-                desc_produto: produto.DESC_PRODUTO ?? '',
-                mar_descricao: produto.MAR_DESCRICAO,
-                ref_fabricante: produto.REF_FABRICANTE,
-                ref_fornecedor: produto.REF_FORNECEDOR,
-                localizacao: produto.LOCALIZACAO,
-                unidade: produto.UNIDADE,
-                aplicacoes: produto.APLICACOES,
-                qtde_saida: produto.QTDE_SAIDA,
-                estoque: produto.ESTOQUE,
-                reserva: produto.RESERVA,
-              },
+            paraCriar.push({
+              identificador_item: targetIdentificador,
+              contagem_cuid: grupoContagem,
+              data: produto.DATA, // salva apenas yyyy-mm-dd
+              cod_produto: produto.COD_PRODUTO,
+              desc_produto: produto.DESC_PRODUTO ?? '',
+              mar_descricao: produto.MAR_DESCRICAO,
+              ref_fabricante: produto.REF_FABRICANTE,
+              ref_fornecedor: produto.REF_FORNECEDOR,
+              localizacao: produto.LOCALIZACAO,
+              unidade: produto.UNIDADE,
+              aplicacoes: produto.APLICACOES,
+              qtde_saida: produto.QTDE_SAIDA,
+              estoque: produto.ESTOQUE,
+              reserva: produto.RESERVA,
             });
-            itens.push(item);
           }
 
           // AVULSA PARCIAL: locações do cadastro que ficaram fora da seleção viram itens
@@ -1106,27 +1160,24 @@ export class EstoqueSaidasRepository {
             });
 
             for (const loc of faltantes) {
-              const item = await tx.est_contagem_itens.create({
-                data: {
-                  identificador_item: targetIdentificador,
-                  contagem_cuid: grupoContagem,
-                  data: base.DATA,
-                  cod_produto: base.COD_PRODUTO,
-                  desc_produto: base.DESC_PRODUTO ?? '',
-                  mar_descricao: base.MAR_DESCRICAO,
-                  ref_fabricante: base.REF_FABRICANTE,
-                  ref_fornecedor: base.REF_FORNECEDOR,
-                  localizacao: loc,
-                  unidade: base.UNIDADE,
-                  aplicacoes: null,
-                  qtde_saida: 0,
-                  estoque: base.ESTOQUE,
-                  reserva: base.RESERVA,
-                  pendente: true,
-                  conferir: false,
-                },
+              paraCriar.push({
+                identificador_item: targetIdentificador,
+                contagem_cuid: grupoContagem,
+                data: base.DATA,
+                cod_produto: base.COD_PRODUTO,
+                desc_produto: base.DESC_PRODUTO ?? '',
+                mar_descricao: base.MAR_DESCRICAO,
+                ref_fabricante: base.REF_FABRICANTE,
+                ref_fornecedor: base.REF_FORNECEDOR,
+                localizacao: loc,
+                unidade: base.UNIDADE,
+                aplicacoes: null,
+                qtde_saida: 0,
+                estoque: base.ESTOQUE,
+                reserva: base.RESERVA,
+                pendente: true,
+                conferir: false,
               });
-              itens.push(item);
             }
 
             if (faltantes.length > 0) {
@@ -1137,6 +1188,10 @@ export class EstoqueSaidasRepository {
               });
             }
           }
+        }
+
+        if (paraCriar.length > 0) {
+          await tx.est_contagem_itens.createMany({ data: paraCriar });
         }
 
         // ADOÇÃO DE PENDENTES: itens que outra avulsa deixou aguardando entram nesta
@@ -1150,14 +1205,14 @@ export class EstoqueSaidasRepository {
               pendente: true,
               logs: { none: {} },
             },
+            select: { id: true },
           });
 
-          for (const itemPendente of adotaveis) {
-            const adotado = await tx.est_contagem_itens.update({
-              where: { id: itemPendente.id },
+          if (adotaveis.length > 0) {
+            await tx.est_contagem_itens.updateMany({
+              where: { id: { in: adotaveis.map((a) => a.id) } },
               data: { contagem_cuid: grupoContagem, pendente: false, conferir: true },
             });
-            itens.push(adotado);
           }
 
           if (adotaveis.length < itens_pendentes_ids.length) {
@@ -1166,11 +1221,21 @@ export class EstoqueSaidasRepository {
             );
           }
         }
+
+        // O retorno traz os itens como ficaram no banco (criados + adotados).
+        itens = await tx.est_contagem_itens.findMany({
+          where: { contagem_cuid: grupoContagem },
+        });
       } else {
         itens = itensExistentes;
       }
 
       return { ...contagem, itens };
+    }, {
+      // Avulsa grande: mesmo em lote, criar mais de mil itens não cabe nos 5s
+      // padrão da transação interativa do Prisma — e estourar o tempo desfaz tudo.
+      maxWait: 30_000,
+      timeout: 300_000,
     });
 
     // `pendencias` alimenta o aviso da tela: "esses produtos têm locações que ficaram
