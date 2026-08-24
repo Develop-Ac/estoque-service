@@ -462,9 +462,15 @@ export class AuditoriaService {
         // avulsas ativas que compartilham produto/dia (quem deixou pendência e quem a
         // adotou), até estabilizar. Como o seletor mostra o grupo UMA vez só, a auditoria
         // precisa cobrir os produtos de todas as sessões do grupo — não só da principal.
+        //
+        // O fecho avança POR SESSÃO, em lote: uma avulsa grande tem centenas de
+        // produtos, e duas consultas por item não terminam dentro do tempo da
+        // requisição — a tela abortava e a contagem "sumia" da auditoria.
         const grupos = new Map<string, { cod_produto: number; desc_produto: string; data: Date }>();
         const cuidsVisitados = new Set<string>([contagemCuid]);
         const fila: string[] = [contagemCuid];
+
+        const chaveDe = (cod: number, data: Date) => `${cod}-${data.toISOString().slice(0, 10)}`;
 
         while (fila.length > 0) {
             const cuidAtual = fila.shift() as string;
@@ -473,33 +479,53 @@ export class AuditoriaService {
                 select: { cod_produto: true, desc_produto: true, data: true },
             });
 
+            const novos: typeof itensDaSessao = [];
             for (const item of itensDaSessao) {
-                const chave = `${item.cod_produto}-${item.data.toISOString().slice(0, 10)}`;
+                const chave = chaveDe(item.cod_produto, item.data);
                 if (grupos.has(chave)) continue;
                 grupos.set(chave, { cod_produto: item.cod_produto, desc_produto: item.desc_produto, data: item.data });
+                novos.push(item);
+            }
+            if (novos.length === 0) continue;
 
-                // Avulsas ativas que também têm este produto/dia entram no fecho.
-                const inicioDia = new Date(item.data);
-                inicioDia.setUTCHours(0, 0, 0, 0);
-                const fimDia = new Date(item.data);
-                fimDia.setUTCHours(23, 59, 59, 999);
+            // Irmãos de TODOS os produtos/dia novos numa consulta só: faixa de datas
+            // min..max + recorte exato por chave em memória.
+            let minIni: Date | null = null;
+            let maxFim: Date | null = null;
+            for (const item of novos) {
+                const ini = new Date(item.data);
+                ini.setUTCHours(0, 0, 0, 0);
+                const fim = new Date(item.data);
+                fim.setUTCHours(23, 59, 59, 999);
+                if (!minIni || ini < minIni) minIni = ini;
+                if (!maxFim || fim > maxFim) maxFim = fim;
+            }
+            const chavesNovas = new Set(novos.map(n => chaveDe(n.cod_produto, n.data)));
 
-                const irmaos = await this.prisma.est_contagem_itens.findMany({
-                    where: { cod_produto: item.cod_produto, data: { gte: inicioDia, lte: fimDia } },
+            const irmaos = await this.prisma.est_contagem_itens.findMany({
+                where: {
+                    cod_produto: { in: [...new Set(novos.map(n => n.cod_produto))] },
+                    data: { gte: minIni!, lte: maxFim! },
+                },
+                select: { contagem_cuid: true, cod_produto: true, data: true },
+            });
+
+            const cuidsCandidatos = new Set<string>();
+            for (const i of irmaos) {
+                if (!i.contagem_cuid || cuidsVisitados.has(i.contagem_cuid)) continue;
+                if (!chavesNovas.has(chaveDe(i.cod_produto, i.data))) continue;
+                cuidsCandidatos.add(i.contagem_cuid);
+            }
+
+            if (cuidsCandidatos.size > 0) {
+                const avulsasAtivas = await this.prisma.est_contagem.findMany({
+                    where: { contagem_cuid: { in: [...cuidsCandidatos] }, tipo: 2, status: 0 },
                     select: { contagem_cuid: true },
-                    distinct: ['contagem_cuid'],
                 });
-                const cuidsNovos = irmaos.map(i => i.contagem_cuid).filter(c => c && !cuidsVisitados.has(c));
-                if (cuidsNovos.length > 0) {
-                    const avulsasAtivas = await this.prisma.est_contagem.findMany({
-                        where: { contagem_cuid: { in: cuidsNovos }, tipo: 2, status: 0 },
-                        select: { contagem_cuid: true },
-                    });
-                    for (const s of avulsasAtivas) {
-                        if (s.contagem_cuid && !cuidsVisitados.has(s.contagem_cuid)) {
-                            cuidsVisitados.add(s.contagem_cuid);
-                            fila.push(s.contagem_cuid);
-                        }
+                for (const s of avulsasAtivas) {
+                    if (s.contagem_cuid && !cuidsVisitados.has(s.contagem_cuid)) {
+                        cuidsVisitados.add(s.contagem_cuid);
+                        fila.push(s.contagem_cuid);
                     }
                 }
             }
@@ -513,7 +539,7 @@ export class AuditoriaService {
         // ainda conta.
         const rodadasGrupo = await this.prisma.est_contagem.findMany({
             where: { contagem_cuid: { in: [...cuidsVisitados] }, status: 0 },
-            select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true },
+            select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true, piso: true },
         });
         const rodadasPorCuid = new Map<string, typeof rodadasGrupo>();
         for (const r of rodadasGrupo) {
@@ -527,9 +553,55 @@ export class AuditoriaService {
             return !!r1?.data_fim && !rodadas.some(r => r.liberado_contagem);
         });
 
+        // Quantas rodadas o grupo TEM (a avulsa escolhe 1 a 3 na criação): é a régua
+        // de exibição/decisão das diferenças — a "diferença final" é a da última
+        // rodada existente, não a da 3ª.
+        const totalRodadasGrupo = Math.min(3, Math.max(1, ...rodadasGrupo.map(r => r.contagem)));
+
+        // Nome (piso) da rodada 1 de cada sessão do fecho — para "sessões vinculadas".
+        const nomePorCuid = new Map<string, string | null>();
+        for (const [cuid, rodadas] of rodadasPorCuid) {
+            const r1 = rodadas.find(r => r.contagem === 1) ?? rodadas[0];
+            nomePorCuid.set(cuid, r1?.piso ?? null);
+        }
+
         let systemUser = await this.prisma.sis_usuarios.findFirst({ where: { nome: 'SISTEMA' } });
         if (!systemUser) {
             systemUser = await this.prisma.sis_usuarios.findFirst();
+        }
+
+        const codigosProdutos = [...new Set([...grupos.values()].map(g => g.cod_produto))];
+
+        // Estoque atual em LOTE: chamadas unitárias disparadas em paralelo por
+        // fatias — o agrupador da erp-api junta as que chegam na mesma janela num
+        // único SELECT com IN. Sequencial, eram centenas de idas ao ERP.
+        const estoquePorProduto = new Map<number, number | null>();
+        const FATIA_ESTOQUE = 25;
+        for (let i = 0; i < codigosProdutos.length; i += FATIA_ESTOQUE) {
+            const fatia = codigosProdutos.slice(i, i + FATIA_ESTOQUE);
+            const resultados = await Promise.all(fatia.map(async (cod) => {
+                try {
+                    const info = await this.contagemService.getEstoqueProduto(cod);
+                    return [cod, info?.ESTOQUE ?? null] as const;
+                } catch {
+                    return [cod, null] as const;
+                }
+            }));
+            for (const [cod, estoque] of resultados) estoquePorProduto.set(cod, estoque);
+        }
+
+        // Auditorias existentes em LOTE (mais recente primeiro por produto); o filtro
+        // fino por cuids envolvidos acontece no laço. Auto-auditorias criadas nesta
+        // chamada entram na frente da lista — a recorrência as enxerga como antes.
+        const auditoriasTodas = await this.prisma.est_auditoria.findMany({
+            where: { cod_produto: { in: codigosProdutos }, status: 1 },
+            orderBy: { created_at: 'desc' },
+        });
+        const auditoriasPorProduto = new Map<number, typeof auditoriasTodas>();
+        for (const a of auditoriasTodas) {
+            const lista = auditoriasPorProduto.get(a.cod_produto);
+            if (lista) lista.push(a);
+            else auditoriasPorProduto.set(a.cod_produto, [a]);
         }
 
         const result: any[] = [];
@@ -541,18 +613,13 @@ export class AuditoriaService {
             const cuidsEnvolvidos = consolidado.cuids;
 
             // Sessões vinculadas = as outras sessões que têm locações deste produto/dia
-            // (quem deixou a pendência ou quem a adotou).
+            // (quem deixou a pendência ou quem a adotou). Nomes já pré-buscados.
             const outrasSessoes = cuidsEnvolvidos.filter(c => c !== contagemCuid);
-            let sessoesVinculadas: string[] = [];
-            if (outrasSessoes.length > 0) {
-                const vinculadas = await this.prisma.est_contagem.findMany({
-                    where: { contagem_cuid: { in: outrasSessoes }, contagem: 1, status: 0 },
-                    select: { piso: true },
-                });
-                sessoesVinculadas = [...new Set(
-                    vinculadas.map(v => v.piso).filter((p): p is string => !!p),
-                )];
-            }
+            const sessoesVinculadas = [...new Set(
+                outrasSessoes
+                    .map(c => nomePorCuid.get(c))
+                    .filter((p): p is string => !!p),
+            )];
 
             // Histórico consolidado: logs de TODAS as locações do produto/dia, de todas
             // as sessões vinculadas — é o que torna a auditoria da avulsa correta.
@@ -584,8 +651,7 @@ export class AuditoriaService {
             });
 
             const estoqueSnapshot = consolidado.estoque_referencia;
-            const estoqueAtualInfo = await this.contagemService.getEstoqueProduto(grupo.cod_produto);
-            const estoqueAtual = estoqueAtualInfo?.ESTOQUE ?? null;
+            const estoqueAtual = estoquePorProduto.get(grupo.cod_produto) ?? null;
 
             const diferencas = {
                 1: history[1].total - estoqueSnapshot,
@@ -593,14 +659,9 @@ export class AuditoriaService {
                 3: history[3].total - estoqueSnapshot,
             };
 
-            let audetado = await this.prisma.est_auditoria.findFirst({
-                where: {
-                    cod_produto: grupo.cod_produto,
-                    contagem_cuid: { in: cuidsEnvolvidos },
-                    status: 1,
-                },
-                orderBy: { created_at: 'desc' },
-            });
+            // Mais recente restrita aos cuids envolvidos (lista já vem em ordem desc).
+            let audetado = (auditoriasPorProduto.get(grupo.cod_produto) ?? [])
+                .find(a => cuidsEnvolvidos.includes(a.contagem_cuid)) ?? null;
 
             const aguardandoPendentes = consolidado.status === 'aguardando_pendentes';
 
@@ -622,7 +683,14 @@ export class AuditoriaService {
                     console.error('Erro ao gerar auto-auditoria (avulsa)', e);
                     return null;
                 });
-                if (autoAudit) audetado = autoAudit;
+                if (autoAudit) {
+                    audetado = autoAudit;
+                    // Entra na frente da lista pré-buscada: a recorrência (abaixo) deve
+                    // enxergar a auto-auditoria recém-criada, como no fluxo antigo.
+                    const lista = auditoriasPorProduto.get(grupo.cod_produto);
+                    if (lista) lista.unshift(autoAudit);
+                    else auditoriasPorProduto.set(grupo.cod_produto, [autoAudit]);
+                }
             }
 
             result.push({
@@ -656,6 +724,10 @@ export class AuditoriaService {
                 locacoes_pendentes: consolidado.locacoes_pendentes_nao_contadas,
                 sessoes_vinculadas: sessoesVinculadas,
                 contagem_concluida: grupoConcluido,
+                // Régua das diferenças: o grupo tem 1 a 3 rodadas (escolhidas na
+                // criação da avulsa) e a diferença que decide é a da última existente.
+                total_rodadas: totalRodadasGrupo,
+                diferenca_final: diferencas[totalRodadasGrupo as 1 | 2 | 3],
                 ja_auditado: !!audetado,
                 audit_id: audetado?.id,
                 audit_dados: audetado ? {
@@ -666,14 +738,10 @@ export class AuditoriaService {
             });
         }
 
-        // Recorrência de erro — mesma régua do fluxo por data.
+        // Recorrência de erro — mesma régua do fluxo por data, sobre a lista já
+        // pré-buscada (com as auto-auditorias desta chamada na frente).
         for (const item of result) {
-            const ultimasAuditorias = await this.prisma.est_auditoria.findMany({
-                where: { cod_produto: item.cod_produto, status: 1 },
-                orderBy: { created_at: 'desc' },
-                take: 3,
-                select: { tipo_movimento: true },
-            });
+            const ultimasAuditorias = (auditoriasPorProduto.get(item.cod_produto) ?? []).slice(0, 3);
             item.recorrencia_erro = ultimasAuditorias.some(a =>
                 a.tipo_movimento === 'BAIXA' || a.tipo_movimento === 'INCLUSAO',
             );
