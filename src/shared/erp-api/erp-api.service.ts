@@ -236,6 +236,25 @@ export class ErpApiService {
   }
 
   /**
+   * Saldo de VÁRIOS produtos numa consulta só (`PRO_CODIGO:em:...`, teto de 500
+   * valores por chamada). Quem sabe a lista inteira de antemão manda o lote —
+   * consulta unitária em série é para quando os itens chegam um a um.
+   */
+  async estoqueProdutos(codigos: number[], empresa: number): Promise<any[]> {
+    if (codigos.length === 0) return [];
+    return this.pedir(
+      '/erp/produtos',
+      {
+        empresa,
+        campos: 'PRO_CODIGO,ESTOQUE_DISPONIVEL',
+        f: `PRO_CODIGO:em:${codigos.join(',')}`,
+        limite: 500,
+      },
+      { checarTruncado: false },
+    );
+  }
+
+  /**
    * Saídas de estoque do período, agrupadas por produto e dia.
    *
    * A definição de saída (tudo que não tem origem NFE/CNE) mora no catálogo, do

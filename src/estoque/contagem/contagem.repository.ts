@@ -1619,6 +1619,60 @@ export class EstoqueSaidasRepository {
     return rows.length > 0 ? rows[0] : null;
   }
 
+  /**
+   * Saldo de VÁRIOS produtos de uma vez, em lotes de 500 (teto do `em` da API).
+   * É o caminho para quem conhece a lista inteira (auditoria de uma contagem):
+   * consulta unitária em série sobrecarrega o pool do Firebird sem necessidade.
+   */
+  async getEstoquePorProdutos(codigos: number[], empresa: string = '3'): Promise<Map<number, number>> {
+    if (!/^\d+$/.test(empresa)) {
+      throw new BadRequestException('Empresa inválida');
+    }
+    const inteiros = [...new Set(codigos.filter((c) => Number.isInteger(c)))];
+    const mapa = new Map<number, number>();
+
+    const LOTE = 500;
+    for (let i = 0; i < inteiros.length; i += LOTE) {
+      const lote = inteiros.slice(i, i + LOTE);
+      try {
+        const rows = await this.erpApi.comFallback(
+          () => this.erpApi.estoqueProdutos(lote, Number(empresa)),
+          () => this.getEstoquePorProdutosViaOpenQuery(lote, empresa),
+        );
+        for (const row of rows ?? []) {
+          const cod = Number((row as any).PRO_CODIGO);
+          const estoque = Number((row as any).ESTOQUE ?? (row as any).ESTOQUE_DISPONIVEL);
+          if (Number.isFinite(cod) && Number.isFinite(estoque)) mapa.set(cod, estoque);
+        }
+      } catch (e) {
+        // Falha num lote não derruba os demais: os produtos dele apenas ficam
+        // sem saldo no resultado.
+        console.error(`[ESTOQUE-LOTE] Falha ao buscar saldo de ${lote.length} produtos.`, e);
+      }
+    }
+
+    return mapa;
+  }
+
+  private async getEstoquePorProdutosViaOpenQuery(codigos: number[], empresa: string): Promise<any[]> {
+    if (codigos.length === 0) return [];
+    const innerSql = [
+      'SELECT',
+      '    PRO.PRO_CODIGO,',
+      '    PRO.ESTOQUE_DISPONIVEL AS ESTOQUE',
+      'FROM PRODUTOS PRO',
+      `WHERE PRO.EMPRESA = '${empresa}'`,
+      `    AND PRO.PRO_CODIGO IN (${codigos.join(', ')})`,
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const outerSql = `
+      /* estoque-por-produtos OPENQUERY */
+      SELECT *
+      FROM OPENQUERY(CONSULTA, '${innerEscaped}');
+    `;
+    return this.oq.query(outerSql, {}, { timeout: 120_000 });
+  }
+
   async updateLiberadoContagem(
     contagem_cuid: string,
     contagem: number,

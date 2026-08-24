@@ -572,22 +572,19 @@ export class AuditoriaService {
 
         const codigosProdutos = [...new Set([...grupos.values()].map(g => g.cod_produto))];
 
-        // Estoque atual em LOTE: chamadas unitárias disparadas em paralelo por
-        // fatias — o agrupador da erp-api junta as que chegam na mesma janela num
-        // único SELECT com IN. Sequencial, eram centenas de idas ao ERP.
+        // Estoque atual em LOTE de verdade (`PRO_CODIGO:em:...`, 500 por consulta):
+        // a lista inteira é conhecida de antemão, então não há razão para uma
+        // requisição por produto. Estoque atual é informativo na tela — falha
+        // aqui não pode derrubar a auditoria, os produtos só ficam sem o valor.
         const estoquePorProduto = new Map<number, number | null>();
-        const FATIA_ESTOQUE = 25;
-        for (let i = 0; i < codigosProdutos.length; i += FATIA_ESTOQUE) {
-            const fatia = codigosProdutos.slice(i, i + FATIA_ESTOQUE);
-            const resultados = await Promise.all(fatia.map(async (cod) => {
-                try {
-                    const info = await this.contagemService.getEstoqueProduto(cod);
-                    return [cod, info?.ESTOQUE ?? null] as const;
-                } catch {
-                    return [cod, null] as const;
-                }
-            }));
-            for (const [cod, estoque] of resultados) estoquePorProduto.set(cod, estoque);
+        try {
+            const saldoPorProduto = await this.contagemService.getEstoquePorProdutos(codigosProdutos);
+            for (const cod of codigosProdutos) {
+                estoquePorProduto.set(cod, saldoPorProduto.get(cod) ?? null);
+            }
+        } catch (e) {
+            console.error('[AUDITORIA] Falha ao buscar estoque atual em lote; itens seguem sem o valor.', e);
+            for (const cod of codigosProdutos) estoquePorProduto.set(cod, null);
         }
 
         // Auditorias existentes em LOTE (mais recente primeiro por produto); o filtro
