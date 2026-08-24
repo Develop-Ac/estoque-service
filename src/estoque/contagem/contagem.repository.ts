@@ -494,17 +494,28 @@ export class EstoqueSaidasRepository {
       );
     }
 
-    // Vários códigos: uma consulta por código, em paralelo — o agrupador do outro lado
-    // junta as chamadas que chegam na mesma janela num único SELECT com IN.
-    const linhas = codigos.length > 0
-      ? (await Promise.all(
-          codigos.map((c) => this.erpApi.produtosPorFiltro({
-            empresa, cod_produto: c, marca, grupo, subgrupo, descricao: descricao || undefined,
-          })),
-        )).flat()
-      : await this.erpApi.produtosPorFiltro({
-          empresa, marca, grupo, subgrupo, descricao: descricao || undefined,
+    // Vários códigos: um único `PRO_CODIGO:em:...` por lote de 500 (teto do
+    // operador no catálogo). Esta consulta pede campo de relação (marca), então
+    // o agrupador do outro lado NÃO junta chamadas unitárias — em paralelo elas
+    // viram N consultas reais disputando o pool de 6 conexões do Firebird.
+    const LOTE_EM = 500;
+    let linhas: any[];
+    if (codigos.length > 0) {
+      linhas = [];
+      for (let i = 0; i < codigos.length; i += LOTE_EM) {
+        const parte = await this.erpApi.produtosPorFiltro({
+          empresa,
+          cod_produtos: codigos.slice(i, i + LOTE_EM),
+          marca, grupo, subgrupo,
+          descricao: descricao || undefined,
         });
+        linhas.push(...parte);
+      }
+    } else {
+      linhas = await this.erpApi.produtosPorFiltro({
+        empresa, marca, grupo, subgrupo, descricao: descricao || undefined,
+      });
+    }
 
     const hoje = new Date();
     // Saldo é soma de duas colunas: o catálogo filtra coluna a coluna, então

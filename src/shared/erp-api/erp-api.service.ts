@@ -42,6 +42,8 @@ interface RespostaErp {
 export interface FiltroProdutos {
   empresa: string;
   cod_produto?: number;
+  /** Vários códigos numa consulta só (`PRO_CODIGO:em:...`, teto de 500 valores). */
+  cod_produtos?: number[];
   marca?: number;
   grupo?: number;
   subgrupo?: number;
@@ -260,6 +262,11 @@ export class ErpApiService {
   async produtosPorFiltro(f: FiltroProdutos): Promise<any[]> {
     const filtros: string[] = [];
     if (f.cod_produto != null) filtros.push(`PRO_CODIGO:igual:${f.cod_produto}`);
+    // IMPORTANTE: esta consulta pede campo de relação (marca.MAR_DESCRICAO), e o
+    // agrupador do outro lado NÃO junta consultas com relação. Vários códigos
+    // precisam ir num único `em` — N chamadas unitárias viram N consultas reais
+    // no Firebird disputando o pool.
+    if (f.cod_produtos?.length) filtros.push(`PRO_CODIGO:em:${f.cod_produtos.join(',')}`);
     if (f.marca != null) filtros.push(`MAR_CODIGO:igual:${f.marca}`);
     if (f.subgrupo != null) filtros.push(`SUBGRP_CODIGO:igual:${f.subgrupo}`);
     if (f.grupo != null) filtros.push(`grupo.GRP_CODIGO:igual:${f.grupo}`);
