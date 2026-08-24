@@ -1146,7 +1146,10 @@ export class EstoqueSaidasRepository {
               unidade: produto.UNIDADE,
               aplicacoes: produto.APLICACOES,
               qtde_saida: produto.QTDE_SAIDA,
-              estoque: produto.ESTOQUE,
+              // Snapshot de comparação = saldo FÍSICO esperado (disponível +
+              // reservado): o contador conta o que está na prateleira, e o
+              // reservado ainda está lá. `reserva` fica separada só para exibição.
+              estoque: produto.ESTOQUE + produto.RESERVA,
               reserva: produto.RESERVA,
             });
           }
@@ -1184,7 +1187,7 @@ export class EstoqueSaidasRepository {
                 unidade: base.UNIDADE,
                 aplicacoes: null,
                 qtde_saida: 0,
-                estoque: base.ESTOQUE,
+                estoque: base.ESTOQUE + base.RESERVA,
                 reserva: base.RESERVA,
                 pendente: true,
                 conferir: false,
@@ -1572,9 +1575,15 @@ export class EstoqueSaidasRepository {
         if (!linha) return null;
         // Mesmas chaves que o driver devolvia (o Firebird responde em MAIÚSCULAS):
         // quem consome lê `.ESTOQUE`, e o contrato não muda com a troca de caminho.
+        //
+        // ESTOQUE aqui é o saldo FÍSICO esperado na prateleira: disponível +
+        // reservado. O reservado ainda não saiu do estoque — uma contagem que
+        // fosse comparada só com o disponível acusaria sobra falsa.
         return {
           PRO_CODIGO: Number(linha.PRO_CODIGO),
-          ESTOQUE: Number(linha.ESTOQUE_DISPONIVEL),
+          ESTOQUE:
+            (Number(linha.ESTOQUE_DISPONIVEL) || 0) +
+            (Number(linha.ESTOQUE_RESERVADO) || 0),
         } as unknown as ConferirEstoqueResponseDto;
       },
       () => this.getEstoqueProdutoViaOpenQuery(codProduto, empresa),
@@ -1595,10 +1604,12 @@ export class EstoqueSaidasRepository {
     // produto sem movimentação ou sem marca devolvia ZERO linhas, e quem chama
     // interpreta null como "não consegui saber o estoque" e usa o snapshot
     // antigo da contagem. O saldo aparecia desatualizado sem nenhum erro no log.
+    // Saldo físico esperado = disponível + reservado (o reservado ainda está
+    // na prateleira; comparar só com o disponível acusaria sobra falsa).
     const innerSql = [
       'SELECT',
       '    PRO.PRO_CODIGO,',
-      '    PRO.ESTOQUE_DISPONIVEL AS ESTOQUE',
+      '    COALESCE(PRO.ESTOQUE_DISPONIVEL, 0) + COALESCE(PRO.ESTOQUE_RESERVADO, 0) AS ESTOQUE',
       'FROM PRODUTOS PRO',
       `WHERE PRO.EMPRESA = '${empresa}'`,
       `    AND PRO.PRO_CODIGO = ${codProduto}`,
@@ -1641,7 +1652,13 @@ export class EstoqueSaidasRepository {
         );
         for (const row of rows ?? []) {
           const cod = Number((row as any).PRO_CODIGO);
-          const estoque = Number((row as any).ESTOQUE ?? (row as any).ESTOQUE_DISPONIVEL);
+          // Pelo OPENQUERY o ESTOQUE já chega somado (disponível + reservado);
+          // pela API as duas colunas vêm separadas e a soma é feita aqui.
+          const estoque =
+            (row as any).ESTOQUE != null
+              ? Number((row as any).ESTOQUE)
+              : (Number((row as any).ESTOQUE_DISPONIVEL) || 0) +
+                (Number((row as any).ESTOQUE_RESERVADO) || 0);
           if (Number.isFinite(cod) && Number.isFinite(estoque)) mapa.set(cod, estoque);
         }
       } catch (e) {
@@ -1659,7 +1676,7 @@ export class EstoqueSaidasRepository {
     const innerSql = [
       'SELECT',
       '    PRO.PRO_CODIGO,',
-      '    PRO.ESTOQUE_DISPONIVEL AS ESTOQUE',
+      '    COALESCE(PRO.ESTOQUE_DISPONIVEL, 0) + COALESCE(PRO.ESTOQUE_RESERVADO, 0) AS ESTOQUE',
       'FROM PRODUTOS PRO',
       `WHERE PRO.EMPRESA = '${empresa}'`,
       `    AND PRO.PRO_CODIGO IN (${codigos.join(', ')})`,

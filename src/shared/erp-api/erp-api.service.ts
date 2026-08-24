@@ -226,7 +226,7 @@ export class ErpApiService {
       '/erp/produtos',
       {
         empresa,
-        campos: 'PRO_CODIGO,ESTOQUE_DISPONIVEL',
+        campos: 'PRO_CODIGO,ESTOQUE_DISPONIVEL,ESTOQUE_RESERVADO',
         f: `PRO_CODIGO:igual:${codProduto}`,
         limite: 1,
       },
@@ -246,7 +246,7 @@ export class ErpApiService {
       '/erp/produtos',
       {
         empresa,
-        campos: 'PRO_CODIGO,ESTOQUE_DISPONIVEL',
+        campos: 'PRO_CODIGO,ESTOQUE_DISPONIVEL,ESTOQUE_RESERVADO',
         f: `PRO_CODIGO:em:${codigos.join(',')}`,
         limite: 500,
       },
