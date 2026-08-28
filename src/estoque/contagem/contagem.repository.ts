@@ -1984,26 +1984,67 @@ export class EstoqueSaidasRepository {
       return [];
     }
 
-    // 2. Buscar os itens associados a este CUID
+    // 2. Itens da sessão: definem os produtos/dia que o modal precisa mostrar.
     const itens = await this.prisma.est_contagem_itens.findMany({
       where: { contagem_cuid: contagem.contagem_cuid },
-      select: { identificador_item: true }
+      select: { cod_produto: true, data: true }
     });
 
-    // Extrair identificadores únicos
-    const identificadores = [...new Set(itens.map(i => i.identificador_item).filter(Boolean))];
-
-    if (identificadores.length === 0) {
+    if (itens.length === 0) {
       return [];
     }
 
-    // 2. Buscar TODOS os logs que referenciam esses identificadores
-    //    Isso traz logs dessa contagem E de outras contagens (irmãs)
+    // 3. O produto/dia inteiro pode estar espalhado por sessões IRMÃS: uma outra
+    //    sessão do mesmo produto/dia recebe identificador com versão (-v2), então
+    //    buscar logs pelo identificador desta sessão deixaria de fora as locações
+    //    contadas nas irmãs. A visão do modal precisa da mesma abrangência da
+    //    consolidação que valida o produto: TODOS os itens ativos do produto/dia,
+    //    de todas as sessões — é a soma deles que fecha (ou não) com o estoque.
+    //    Busca única pela faixa de datas + recorte por chave produto-dia em memória.
+    const chaveDe = (cod: number, data: Date) => `${cod}-${data.toISOString().slice(0, 10)}`;
+    const chavesDaSessao = new Set(itens.map(i => chaveDe(i.cod_produto, i.data)));
+    const codigos = [...new Set(itens.map(i => i.cod_produto))];
+    let minIni: Date | null = null;
+    let maxFim: Date | null = null;
+    for (const i of itens) {
+      const ini = new Date(i.data);
+      ini.setUTCHours(0, 0, 0, 0);
+      const fim = new Date(i.data);
+      fim.setUTCHours(23, 59, 59, 999);
+      if (!minIni || ini < minIni) minIni = ini;
+      if (!maxFim || fim > maxFim) maxFim = fim;
+    }
+
+    const todosItens = await this.prisma.est_contagem_itens.findMany({
+      where: {
+        cod_produto: { in: codigos },
+        data: { gte: minIni!, lte: maxFim! },
+      },
+      select: { id: true, cod_produto: true, data: true, contagem_cuid: true },
+    });
+
+    // Sessões canceladas ficam de fora — como na consolidação.
+    const cuidsEnvolvidos = [...new Set(todosItens.map(i => i.contagem_cuid).filter((c): c is string => !!c))];
+    const sessoesAtivas = cuidsEnvolvidos.length
+      ? await this.prisma.est_contagem.findMany({
+        where: { contagem_cuid: { in: cuidsEnvolvidos }, status: 0 },
+        select: { contagem_cuid: true },
+      })
+      : [];
+    const cuidsAtivos = new Set(sessoesAtivas.map(s => s.contagem_cuid).filter((c): c is string => !!c));
+
+    const idsItens = todosItens
+      .filter(i => cuidsAtivos.has(i.contagem_cuid) && chavesDaSessao.has(chaveDe(i.cod_produto, i.data)))
+      .map(i => i.id);
+
+    if (idsItens.length === 0) {
+      return [];
+    }
+
+    // 4. Todos os logs desses itens (desta sessão e das irmãs).
     const logs = await this.prisma.est_contagem_log.findMany({
       where: {
-        identificador_item: {
-          in: identificadores as string[]
-        }
+        item_id: { in: idsItens }
       },
       include: {
         item: {
