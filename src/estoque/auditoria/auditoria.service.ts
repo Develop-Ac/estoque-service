@@ -189,10 +189,12 @@ export class AuditoriaService {
 
             // AUTO-AUDITORIA: o produto é dado como correto quando uma rodada INTEIRA
             // fechou somando todas as locações (rodadas nunca se misturam), ou quando a
-            // 3ª contagem bateu com o estoque.
+            // última rodada CONTADA bateu com o estoque (rodada sem registro não decide).
             const motivoCorreto = consolidado?.correto
                 ? consolidado.motivo
-                : (diferencas[3] === 0 ? 'Terceira contagem correta' : null);
+                : (ultimaRodadaContada !== null && diferencas[ultimaRodadaContada] === 0
+                    ? `${ultimaRodadaContada}ª contagem (última contada) fechou com o estoque`
+                    : null);
 
             if (motivoCorreto && !audetado && mainCuid && systemUser) {
                 // Criar auditoria automática
@@ -678,9 +680,17 @@ export class AuditoriaService {
 
             const aguardandoPendentes = consolidado.status === 'aguardando_pendentes';
 
+            // Produto correto: uma rodada inteira fechou (regra da consolidação) OU a
+            // última rodada CONTADA fechou com o estoque. O segundo caso cobre o
+            // produto multi-sessão em que a recontagem não repassa toda locação (a que
+            // ficou de fora vale zero na rodada) — a soma da rodada final batendo com o
+            // estoque é o veredito, e sem isso o item nunca sai da fila da auditoria.
+            const corretoPelaRodadaFinal =
+                ultimaRodadaContada !== null && !aguardandoPendentes && diferencas[ultimaRodadaContada] === 0;
+
             // Auto-auditoria CORRETO: só quando o GRUPO todo foi concluído — antes disso
             // o resultado ainda pode mudar.
-            if (consolidado.correto && grupoConcluido && !audetado && systemUser) {
+            if ((consolidado.correto || corretoPelaRodadaFinal) && grupoConcluido && !audetado && systemUser) {
                 const autoAudit = await this.prisma.est_auditoria.create({
                     data: {
                         contagem_cuid: contagemCuid,
@@ -688,7 +698,8 @@ export class AuditoriaService {
                         diferenca_apontada: 0,
                         tipo_movimento: 'CORRETO',
                         quantidade_movimento: 0,
-                        observacao: consolidado.motivo ?? 'Contagem fechou com o estoque',
+                        observacao: consolidado.motivo
+                            ?? `${rodadaFinal}ª contagem (última contada) fechou com o estoque`,
                         usuario_id: systemUser.id,
                         status: 1,
                     },
