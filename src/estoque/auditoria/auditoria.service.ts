@@ -100,12 +100,17 @@ export class AuditoriaService {
 
             const cuidsEnvolvidos = [...new Set(groupItems.map(i => i.contagem_cuid))];
 
+            // Só sessões DIÁRIAS (tipo 1) contam aqui: uma avulsa criada com 3 rodadas
+            // também tem "3ª fechada" e, sem o filtro, o produto dela caía na auditoria
+            // por data além da tela própria da avulsa (que consolida as sessões
+            // vinculadas — é lá que ele deve ser auditado).
             const contagensFechadas = await this.prisma.est_contagem.findMany({
                 where: {
                     contagem_cuid: { in: cuidsEnvolvidos },
                     contagem: 3,
                     liberado_contagem: false,
-                    status: 0
+                    status: 0,
+                    tipo: 1
                 },
                 select: {
                     contagem_cuid: true,
