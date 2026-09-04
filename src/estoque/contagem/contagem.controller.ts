@@ -272,12 +272,14 @@ export class EstoqueSaidasController {
     @Query('pageSize') pageSize?: number,
     @Query('data') data?: string,
     @Query('piso') piso?: string,
+    @Query('tipo') tipo?: string,
   ): Promise<any> { // Changed return type to any for now to support pagination object
     return this.service.getAllContagens({
       page: page ? Number(page) : 1,
       pageSize: pageSize ? Number(pageSize) : 20,
       data,
-      piso
+      piso,
+      tipo: tipo ? Number(tipo) : undefined,
     });
   }
 

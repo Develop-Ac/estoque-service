@@ -870,7 +870,8 @@ export class EstoqueSaidasRepository {
       contagem_cuid,
       piso,
       tipo,
-      itens_pendentes_ids
+      itens_pendentes_ids,
+      qtd_rodadas
     } = createContagemDto;
 
     // limpa possíveis NULs no nome
@@ -945,6 +946,41 @@ export class EstoqueSaidasRepository {
       : [];
 
     const ehAvulsa = (tipo ?? 1) === 2;
+
+    // TRAVA DA COMPLEMENTAR: quem adota itens pendentes precisa ter a MESMA
+    // quantidade de rodadas da contagem principal. Rodadas não se misturam na
+    // consolidação — uma complementar de 1 rodada adotando pendência de um grupo
+    // de 3 deixa as rodadas 2/3 da principal sem cobertura para sempre, e o
+    // produto cai na auditoria com "Sem registros" nas rodadas seguintes.
+    // A checagem roda no POST da 1ª rodada (é ele que carrega os pendentes).
+    if (ehAvulsa && tipoContagem === 1 && Array.isArray(itens_pendentes_ids) && itens_pendentes_ids.length > 0) {
+      const itensOrigem = await this.prisma.est_contagem_itens.findMany({
+        where: { id: { in: itens_pendentes_ids }, pendente: true },
+        select: { contagem_cuid: true },
+      });
+      const cuidsOrigem = [...new Set(itensOrigem.map(i => i.contagem_cuid).filter((c): c is string => !!c))];
+      if (cuidsOrigem.length > 0) {
+        const rodadasOrigem = await this.prisma.est_contagem.groupBy({
+          by: ['contagem_cuid'],
+          where: { contagem_cuid: { in: cuidsOrigem }, status: 0 },
+          _count: { _all: true },
+        });
+        const qtdsOrigem = [...new Set(rodadasOrigem.map(r => r._count._all))];
+        if (qtdsOrigem.length > 1) {
+          throw new BadRequestException(
+            'Os itens pendentes selecionados vêm de contagens com quantidades de rodadas diferentes. ' +
+            'Complemente uma contagem por vez.',
+          );
+        }
+        const qtdPrincipal = qtdsOrigem[0];
+        if (typeof qtd_rodadas === 'number' && qtd_rodadas !== qtdPrincipal) {
+          throw new BadRequestException(
+            `A contagem principal tem ${qtdPrincipal} ${qtdPrincipal === 1 ? 'rodada' : 'rodadas'}: ` +
+            `a complementar que adota os pendentes dela precisa ter a mesma quantidade (foi enviada com ${qtd_rodadas}).`,
+          );
+        }
+      }
+    }
 
     // AVULSA PARCIAL: o Celta não separa saldo por locação, então um produto contado em
     // UMA locação só valida quando as outras também forem contadas. Aqui buscamos as
@@ -1911,18 +1947,21 @@ export class EstoqueSaidasRepository {
     if (itens.length === 0) return [];
 
     // Só valem pendências de sessão ativa; o nome da contagem de origem (coluna
-    // 'piso') vai junto para o usuário saber de onde a pendência veio.
+    // 'piso') vai junto para o usuário saber de onde a pendência veio, e a
+    // quantidade de rodadas do grupo de origem para a tela TRAVAR a complementar
+    // na mesma quantidade (rodadas não se misturam na consolidação).
     const cuids = [...new Set(itens.map(i => i.contagem_cuid))];
     const sessoes = await this.prisma.est_contagem.findMany({
       where: { contagem_cuid: { in: cuids }, status: 0, tipo: 2 },
       select: { contagem_cuid: true, piso: true, created_at: true },
     });
 
-    const sessaoPorCuid = new Map<string, { piso: string | null; created_at: Date }>();
+    const sessaoPorCuid = new Map<string, { piso: string | null; created_at: Date; rodadas: number }>();
     for (const s of sessoes) {
-      if (s.contagem_cuid && !sessaoPorCuid.has(s.contagem_cuid)) {
-        sessaoPorCuid.set(s.contagem_cuid, { piso: s.piso, created_at: s.created_at });
-      }
+      if (!s.contagem_cuid) continue;
+      const atual = sessaoPorCuid.get(s.contagem_cuid);
+      if (atual) atual.rodadas++;
+      else sessaoPorCuid.set(s.contagem_cuid, { piso: s.piso, created_at: s.created_at, rodadas: 1 });
     }
 
     return itens
@@ -1931,6 +1970,7 @@ export class EstoqueSaidasRepository {
         ...i,
         contagem_origem: sessaoPorCuid.get(i.contagem_cuid)?.piso ?? null,
         criada_em: sessaoPorCuid.get(i.contagem_cuid)?.created_at ?? null,
+        qtd_rodadas_origem: sessaoPorCuid.get(i.contagem_cuid)?.rodadas ?? null,
       }));
   }
 
@@ -2078,14 +2118,20 @@ export class EstoqueSaidasRepository {
     pageSize?: number;
     data?: string;
     piso?: string;
+    tipo?: number;
   } = {}) {
-    const { page = 1, pageSize = 20, data, piso } = params;
+    const { page = 1, pageSize = 20, data, piso, tipo } = params;
     const skip = (page - 1) * pageSize;
 
     // Construir os filtros dinamicamente
     const whereClause: Prisma.est_contagemWhereInput = {
       status: 0 // Apenas ativos
     };
+
+    // 1 = Diária/Rotativa, 2 = Avulsa (coluna NOT NULL com default 1).
+    if (tipo) {
+      whereClause.tipo = tipo;
+    }
 
     if (piso) {
       // 'piso' guarda o nome da contagem; busca por parte do nome (case-insensitive).

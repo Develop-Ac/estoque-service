@@ -127,7 +127,7 @@ export class EstoqueSaidasService {
     }));
   }
 
-  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string }) {
+  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string; tipo?: number }) {
     return this.repo.getAllContagens(params);
   }
 

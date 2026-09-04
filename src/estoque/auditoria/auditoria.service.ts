@@ -181,6 +181,12 @@ export class AuditoriaService {
                 3: history[3].total - estoqueSnapshot,
             };
 
+            // Última rodada em que o produto foi de fato contado: é ela que decide a
+            // diferença exibida/validada — rodada sem registro compararia zero contra
+            // o estoque e acusaria divergência falsa.
+            const ultimaRodadaContada = ([3, 2, 1] as const)
+                .find(r => history[r].logs.length > 0) ?? null;
+
             // AUTO-AUDITORIA: o produto é dado como correto quando uma rodada INTEIRA
             // fechou somando todas as locações (rodadas nunca se misturam), ou quando a
             // 3ª contagem bateu com o estoque.
@@ -225,6 +231,8 @@ export class AuditoriaService {
                 piso: piso,
                 history,
                 diferencas,
+                ultima_rodada_contada: ultimaRodadaContada,
+                diferenca_final: diferencas[(ultimaRodadaContada ?? 3) as 1 | 2 | 3],
                 // Visão consolidada das locações (inclusive as de outras sessões/pisos):
                 // permite o front explicar por que o produto foi dado como correto.
                 consolidado: consolidado ? {
@@ -656,6 +664,14 @@ export class AuditoriaService {
                 3: history[3].total - estoqueSnapshot,
             };
 
+            // Última rodada em que ESTE produto foi de fato contado. O grupo pode ter
+            // 3 rodadas e o produto ter registros só na 1ª (ex.: locação pendente
+            // adotada por uma avulsa de menos rodadas): validar pela rodada do grupo
+            // compararia zero contra o estoque e acusaria divergência falsa.
+            const ultimaRodadaContada = ([3, 2, 1] as const)
+                .find(r => history[r].logs.length > 0) ?? null;
+            const rodadaFinal = (ultimaRodadaContada ?? totalRodadasGrupo) as 1 | 2 | 3;
+
             // Mais recente restrita aos cuids envolvidos (lista já vem em ordem desc).
             let audetado = (auditoriasPorProduto.get(grupo.cod_produto) ?? [])
                 .find(a => cuidsEnvolvidos.includes(a.contagem_cuid)) ?? null;
@@ -722,9 +738,11 @@ export class AuditoriaService {
                 sessoes_vinculadas: sessoesVinculadas,
                 contagem_concluida: grupoConcluido,
                 // Régua das diferenças: o grupo tem 1 a 3 rodadas (escolhidas na
-                // criação da avulsa) e a diferença que decide é a da última existente.
+                // criação da avulsa), mas quem decide é a última rodada em que o
+                // produto FOI CONTADO — rodada sem registro não valida nada.
                 total_rodadas: totalRodadasGrupo,
-                diferenca_final: diferencas[totalRodadasGrupo as 1 | 2 | 3],
+                ultima_rodada_contada: ultimaRodadaContada,
+                diferenca_final: diferencas[rodadaFinal],
                 ja_auditado: !!audetado,
                 audit_id: audetado?.id,
                 audit_dados: audetado ? {
