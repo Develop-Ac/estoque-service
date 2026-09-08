@@ -168,6 +168,17 @@ function extrairPrateleira(locacaoRaw: string | null | undefined): number | null
   return Number.isFinite(n) ? n : null;
 }
 
+// Prédio/Coluna = os 2 últimos dígitos do bloco (A1403A03 -> 03). A forma curta
+// sem prédio (C16D1) não tem coluna — devolve null e fica de fora do filtro.
+function extrairColuna(locacaoRaw: string | null | undefined): number | null {
+  const m = (locacaoRaw ?? '').toUpperCase().trim().match(/^[A-Z]{1,2}(\d{2,4})[A-Z]\d/);
+  if (!m) return null;
+  const bloco = m[1];
+  if (bloco.length <= 2) return null;
+  const n = parseInt(bloco.slice(-2), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Responsável por montar o T-SQL dinâmico com OPENQUERY(CONSULTA, '...').
  * Observação: OPENQUERY exige string literal; portanto usamos um SQL externo dinâmico
@@ -433,24 +444,47 @@ export class EstoqueSaidasRepository {
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
     piso?: string;         // PISO_A, PISO_B, BOX, VITRINE... (recorte pós-explode)
     prateleira?: number;   // dois dígitos após a letra do piso (recorte pós-explode)
+    // Seleção múltipla (a tela manda listas; os campos singulares seguem aceitos):
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];    // prédio/coluna: os 2 dígitos após a prateleira
   }): Promise<EstoqueSaidaRow[]> {
+    // Normaliza singular -> lista: o recorte é sempre por conjunto.
+    const pisos = (params.pisos ?? ((params.piso ?? '').trim() ? [params.piso!.trim()] : []))
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const prateleiras = new Set(
+      (params.prateleiras ?? (params.prateleira != null ? [params.prateleira] : []))
+        .filter((n) => Number.isFinite(n)),
+    );
+    const colunas = new Set((params.colunas ?? []).filter((n) => Number.isFinite(n)));
+
     const rows = await this.erpApi.comFallback(
-      () => this.fetchProdutosPorFiltroViaApi(params),
-      () => this.fetchProdutosPorFiltroViaOpenQuery(params),
+      // `piso` singular repassado só para a validação de "tem filtro" dos dois caminhos.
+      () => this.fetchProdutosPorFiltroViaApi({ ...params, piso: pisos[0] ?? params.piso }),
+      () => this.fetchProdutosPorFiltroViaOpenQuery({ ...params, piso: pisos[0] ?? params.piso }),
     );
 
-    // Piso e prateleira são atributos da LOCAÇÃO, não do produto: só dá para recortar
-    // depois do explode (uma linha por locação). Por isso o filtro fica aqui, sobre as
-    // linhas prontas, e vale para os dois caminhos (API e OPENQUERY).
-    const piso = (params.piso ?? '').trim();
+    // Piso, prateleira e coluna são atributos da LOCAÇÃO, não do produto: só dá para
+    // recortar depois do explode (uma linha por locação). Por isso o filtro fica aqui,
+    // sobre as linhas prontas, e vale para os dois caminhos (API e OPENQUERY).
     let filtradas = rows;
-    if (piso) {
-      filtradas = filtradas.filter((r) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, piso));
-    }
-    if (params.prateleira != null && Number.isFinite(params.prateleira)) {
-      filtradas = filtradas.filter(
-        (r) => extrairPrateleira((r as any).LOCALIZACAO) === params.prateleira,
+    if (pisos.length > 0) {
+      filtradas = filtradas.filter((r) =>
+        pisos.some((p) => locacaoPertenceAoPiso((r as any).LOCALIZACAO, p)),
       );
+    }
+    if (prateleiras.size > 0) {
+      filtradas = filtradas.filter((r) => {
+        const p = extrairPrateleira((r as any).LOCALIZACAO);
+        return p != null && prateleiras.has(p);
+      });
+    }
+    if (colunas.size > 0) {
+      filtradas = filtradas.filter((r) => {
+        const c = extrairColuna((r as any).LOCALIZACAO);
+        return c != null && colunas.has(c);
+      });
     }
     return filtradas;
   }
@@ -709,58 +743,97 @@ export class EstoqueSaidasRepository {
   // locações do catálogo muda devagar e a varredura é uma ida cara ao Firebird.
   private locacoesCatalogoCache: { empresa: string; expiraEm: number; locacoes: string[] } | null = null;
 
-  /**
-   * Prateleiras existentes num piso — o filtro-filho da avulsa: escolhido o piso, só as
-   * prateleiras dele são oferecidas. Prateleira são os dois dígitos após a letra da
-   * locação (A1204E02 -> 12), então a lista sai de uma varredura só das colunas de
-   * locação dos produtos com saldo, explodida pelas mesmas regras da contagem.
-   */
-  async fetchPrateleirasPorPiso(empresa: string, piso: string): Promise<number[]> {
+  /** Locações do catálogo com saldo (cache de 5 min) — base dos filtros encadeados. */
+  private async getLocacoesComSaldo(empresa: string): Promise<string[]> {
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
-    if (!piso?.trim()) throw new BadRequestException('Informe o piso');
 
     const agora = Date.now();
-    let locacoes: string[];
-
     if (
       this.locacoesCatalogoCache &&
       this.locacoesCatalogoCache.empresa === empresa &&
       this.locacoesCatalogoCache.expiraEm > agora
     ) {
-      locacoes = this.locacoesCatalogoCache.locacoes;
-    } else {
-      const innerSql = [
-        'SELECT PRO.localizacao, PRO.aplicacoes',
-        'FROM PRODUTOS PRO',
-        `WHERE PRO.empresa = '${empresa}'`,
-        'AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0',
-      ].join('\n');
-      const innerEscaped = innerSql.replace(/'/g, "''");
-      const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any }>(
-        `/* prateleiras-por-piso OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
-        {},
-        { timeout: 120_000 },
-      );
-
-      const set = new Set<string>();
-      for (const row of rows ?? []) {
-        const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
-        const rawApp = this.toUtf8Text((row as any).APLICACOES);
-        const principais = extractLocations(rawLoc);
-        for (const l of principais.length ? principais : (rawLoc ? [rawLoc] : [])) set.add(l);
-        for (const l of extractLocations(rawApp)) set.add(l);
-      }
-      locacoes = [...set];
-      this.locacoesCatalogoCache = { empresa, expiraEm: agora + 5 * 60_000, locacoes };
+      return this.locacoesCatalogoCache.locacoes;
     }
+
+    const innerSql = [
+      'SELECT PRO.localizacao, PRO.aplicacoes',
+      'FROM PRODUTOS PRO',
+      `WHERE PRO.empresa = '${empresa}'`,
+      'AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0',
+    ].join('\n');
+    const innerEscaped = innerSql.replace(/'/g, "''");
+    const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any }>(
+      `/* locacoes-catalogo OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
+      {},
+      { timeout: 120_000 },
+    );
+
+    const set = new Set<string>();
+    for (const row of rows ?? []) {
+      const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
+      const rawApp = this.toUtf8Text((row as any).APLICACOES);
+      const principais = extractLocations(rawLoc);
+      for (const l of principais.length ? principais : (rawLoc ? [rawLoc] : [])) set.add(l);
+      for (const l of extractLocations(rawApp)) set.add(l);
+    }
+    const locacoes = [...set];
+    this.locacoesCatalogoCache = { empresa, expiraEm: agora + 5 * 60_000, locacoes };
+    return locacoes;
+  }
+
+  /**
+   * Prateleiras existentes nos pisos informados — o filtro-filho da avulsa: escolhido
+   * o piso, só as prateleiras dele são oferecidas. Prateleira são os dígitos após a
+   * letra da locação menos os 2 do prédio (A1204E02 -> 12), e a lista sai de uma
+   * varredura só das locações dos produtos com saldo, explodida pelas mesmas regras
+   * da contagem. `piso` aceita lista separada por vírgula (seleção múltipla).
+   */
+  async fetchPrateleirasPorPiso(empresa: string, piso: string): Promise<number[]> {
+    const pisos = (piso ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (pisos.length === 0) throw new BadRequestException('Informe o piso');
+
+    const locacoes = await this.getLocacoesComSaldo(empresa);
 
     const prateleiras = new Set<number>();
     for (const loc of locacoes) {
-      if (!locacaoPertenceAoPiso(loc, piso)) continue;
+      if (!pisos.some((p) => locacaoPertenceAoPiso(loc, p))) continue;
       const p = extrairPrateleira(loc);
       if (p != null) prateleiras.add(p);
     }
     return [...prateleiras].sort((a, b) => a - b);
+  }
+
+  /**
+   * Colunas (prédio) existentes nos pisos/prateleiras informados — o terceiro nível
+   * do filtro encadeado da avulsa. `piso` e `prateleira` aceitam listas separadas por
+   * vírgula; prateleira vazia = todas as prateleiras dos pisos.
+   */
+  async fetchColunasPorFiltro(empresa: string, piso: string, prateleira = ''): Promise<number[]> {
+    const pisos = (piso ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (pisos.length === 0) throw new BadRequestException('Informe o piso');
+    const prateleiras = new Set(
+      (prateleira ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(Number)
+        .filter((n) => Number.isFinite(n)),
+    );
+
+    const locacoes = await this.getLocacoesComSaldo(empresa);
+
+    const colunas = new Set<number>();
+    for (const loc of locacoes) {
+      if (!pisos.some((p) => locacaoPertenceAoPiso(loc, p))) continue;
+      if (prateleiras.size > 0) {
+        const p = extrairPrateleira(loc);
+        if (p == null || !prateleiras.has(p)) continue;
+      }
+      const c = extrairColuna(loc);
+      if (c != null) colunas.add(c);
+    }
+    return [...colunas].sort((a, b) => a - b);
   }
 
   /** Lista de marcas (MARCAS) para popular o filtro da avulsa. */

@@ -33,6 +33,9 @@ export class EstoqueSaidasService {
     somente_com_saldo?: boolean;
     piso?: string;
     prateleira?: number;
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchProdutosPorFiltro(filters);
   }
@@ -42,9 +45,14 @@ export class EstoqueSaidasService {
     return this.repo.getItensPendentes();
   }
 
-  /** Prateleiras existentes no piso informado (filtro-filho da avulsa). */
+  /** Prateleiras existentes no(s) piso(s) informado(s) (filtro-filho da avulsa). */
   async listarPrateleiras(empresa: string, piso: string) {
     return this.repo.fetchPrateleirasPorPiso(empresa, piso);
+  }
+
+  /** Colunas (prédio) existentes nos pisos/prateleiras (3º nível do filtro encadeado). */
+  async listarColunas(empresa: string, piso: string, prateleira?: string) {
+    return this.repo.fetchColunasPorFiltro(empresa, piso, prateleira);
   }
 
   async listarGrupos(empresa: string) {

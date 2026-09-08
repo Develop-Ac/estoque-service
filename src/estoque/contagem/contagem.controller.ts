@@ -141,8 +141,17 @@ export class EstoqueSaidasController {
       grupo: toNum(q.grupo),
       subgrupo: toNum(q.subgrupo),
       somente_com_saldo: toBool(q.somente_com_saldo, true),
-      piso: typeof q.piso === 'string' && q.piso.trim() ? q.piso.trim() : undefined,
-      prateleira: toNum(q.prateleira),
+      // Piso/prateleira/coluna aceitam listas separadas por vírgula (seleção
+      // múltipla encadeada na tela da avulsa).
+      pisos: typeof q.piso === 'string' && q.piso.trim()
+        ? q.piso.split(',').map((s: string) => s.trim()).filter(Boolean)
+        : undefined,
+      prateleiras: typeof q.prateleira === 'string' && String(q.prateleira).trim()
+        ? String(q.prateleira).split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+        : undefined,
+      colunas: typeof q.coluna === 'string' && q.coluna.trim()
+        ? q.coluna.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+        : undefined,
     });
   }
 
@@ -154,9 +163,27 @@ export class EstoqueSaidasController {
       'A prateleira é o bloco de dígitos da locação menos os 2 do prédio (1-9 sem zero à esquerda: A903B02 -> 9, A1403A03 -> 14).'
   })
   @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
-  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', description: 'Aceita lista separada por vírgula (PISO_A,BOX)', type: 'string' })
   async getPrateleiras(@Query('empresa') empresa = '3', @Query('piso') piso = '') {
     return this.service.listarPrateleiras(empresa, piso);
+  }
+
+  @Get('colunas')
+  @ApiOperation({
+    summary: 'Listar colunas (prédio) dos pisos/prateleiras (3º nível do filtro da avulsa)',
+    description:
+      'Colunas/prédios existentes nas locações dos pisos e prateleiras informados, extraídas do catálogo ' +
+      'de produtos com saldo. A coluna são os 2 dígitos após a prateleira (A1403A03 -> 3).'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', description: 'Aceita lista separada por vírgula', type: 'string' })
+  @ApiQuery({ name: 'prateleira', required: false, example: '12,14', description: 'Aceita lista separada por vírgula; vazio = todas', type: 'string' })
+  async getColunas(
+    @Query('empresa') empresa = '3',
+    @Query('piso') piso = '',
+    @Query('prateleira') prateleira = '',
+  ) {
+    return this.service.listarColunas(empresa, piso, prateleira);
   }
 
   @Get('pendentes')

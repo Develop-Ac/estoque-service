@@ -70,6 +70,7 @@ export class BuscarProdutosQueryDto {
   @ApiProperty({
     description:
       'Recorte por piso/locação aplicado sobre as linhas explodidas (uma por locação). ' +
+      'Aceita lista separada por vírgula (seleção múltipla: "PISO_A,BOX"). ' +
       'Valores: PISO_A, PISO_B, PISO_C, BOX, A-BOQUETA, A-CX ESCADA, VITRINE, VM, VENDA CASADA.',
     example: 'PISO_A',
     required: false,
@@ -81,12 +82,22 @@ export class BuscarProdutosQueryDto {
   @ApiProperty({
     description:
       'Prateleira/rua (bloco de dígitos da locação menos os 2 do prédio; 1-9 sem zero à esquerda — ' +
-      'A903B02 -> 9, A1403A03 -> 14). Filtro-filho do piso.',
-    example: 14,
+      'A903B02 -> 9, A1403A03 -> 14). Filtro-filho do piso; aceita lista separada por vírgula ("12,14").',
+    example: '14',
     required: false,
   })
   @IsOptional()
-  @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))
-  @IsInt()
-  prateleira?: number;
+  @IsString()
+  prateleira?: string;
+
+  @ApiProperty({
+    description:
+      'Prédio/coluna (os 2 dígitos após a prateleira — A1403A03 -> 3). ' +
+      'Filtro-filho de piso+prateleira; aceita lista separada por vírgula ("3,5").',
+    example: '3',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  coluna?: string;
 }
