@@ -1131,9 +1131,10 @@ export class EstoqueSaidasRepository {
           })).map((r) => r.identificador_item),
         );
 
-        // Itens que os produtos/dia do payload já têm em OUTRAS sessões (avulsa):
-        // busca única cobrindo o intervalo de datas; o recorte por produto/dia usa a
-        // mesma chave `${cod}-${yyyy-mm-dd}` do agrupamento acima.
+        // Itens que os produtos/dia do payload já têm em OUTRAS sessões: alimenta a
+        // adoção de fantasmas (avulsa) e a validação de locação duplicada (todos os
+        // tipos). Busca única cobrindo o intervalo de datas; o recorte por produto/dia
+        // usa a mesma chave `${cod}-${yyyy-mm-dd}` do agrupamento acima.
         type ItemExistente = {
           id: string;
           localizacao: string | null;
@@ -1143,7 +1144,8 @@ export class EstoqueSaidasRepository {
         };
         const existentesPorGrupo = new Map<string, ItemExistente[]>();
         const cuidsAtivos = new Set<string>();
-        if (ehAvulsa && gruposPorProduto.size > 0) {
+        const nomesSessoesAtivas = new Map<string, string>();
+        if (gruposPorProduto.size > 0) {
           let minIni: Date | null = null;
           let maxFim: Date | null = null;
           for (const grupo of gruposPorProduto.values()) {
@@ -1171,10 +1173,14 @@ export class EstoqueSaidasRepository {
             const cuidsExistentes = [...new Set(existentesTodos.map((e) => e.contagem_cuid))];
             const sessoesAtivas = await tx.est_contagem.findMany({
               where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
-              select: { contagem_cuid: true },
+              select: { contagem_cuid: true, piso: true },
             });
             for (const s of sessoesAtivas) {
-              if (s.contagem_cuid) cuidsAtivos.add(s.contagem_cuid);
+              if (!s.contagem_cuid) continue;
+              cuidsAtivos.add(s.contagem_cuid);
+              if (!nomesSessoesAtivas.has(s.contagem_cuid)) {
+                nomesSessoesAtivas.set(s.contagem_cuid, s.piso ?? s.contagem_cuid);
+              }
             }
 
             for (const e of existentesTodos) {
@@ -1188,6 +1194,40 @@ export class EstoqueSaidasRepository {
               else existentesPorGrupo.set(chave, [registro]);
             }
           }
+        }
+
+        // VALIDAÇÃO DE LOCAÇÃO DUPLICADA: um produto/dia/locação só pode viver em UMA
+        // sessão ativa. Se a mesma locação entrar em duas sessões (ex.: avulsa e diária
+        // do mesmo produto no mesmo dia), a consolidação por produto/dia soma as duas
+        // equipes em cada rodada e acusa divergência falsa numa contagem correta.
+        // Fantasma pendente sem contagem não é conflito para a AVULSA — é adoção.
+        const conflitos: string[] = [];
+        for (const [chaveBase, produtosDoGrupo] of gruposPorProduto) {
+          const existentes = existentesPorGrupo.get(chaveBase) ?? [];
+          if (existentes.length === 0) continue;
+          for (const produto of produtosDoGrupo) {
+            const locKey = (produto.LOCALIZACAO ?? '').toUpperCase().trim();
+            if (!locKey) continue;
+            const ocupado = existentes.find((e) =>
+              cuidsAtivos.has(e.contagem_cuid) &&
+              e.contagem_cuid !== grupoContagem &&
+              (e.localizacao ?? '').toUpperCase().trim() === locKey &&
+              !(ehAvulsa && e.pendente && e.logs.length === 0),
+            );
+            if (ocupado) {
+              conflitos.push(
+                `${produto.COD_PRODUTO} (${locKey}) — já na contagem "${nomesSessoesAtivas.get(ocupado.contagem_cuid) ?? ocupado.contagem_cuid}"`,
+              );
+            }
+          }
+        }
+        if (conflitos.length > 0) {
+          const amostra = conflitos.slice(0, 10).join('; ');
+          throw new BadRequestException(
+            `${conflitos.length} produto(s) da seleção já estão em outra contagem ativa no mesmo dia e locação: ${amostra}` +
+            `${conflitos.length > 10 ? '…' : ''}. ` +
+            'Remova-os da seleção ou conclua/cancele a outra contagem antes — a mesma locação em duas contagens somaria as duas equipes na validação e acusaria divergência falsa.',
+          );
         }
 
         // INSERTs acumulados (itens selecionados + pendentes) para um createMany só.
@@ -2100,7 +2140,7 @@ export class EstoqueSaidasRepository {
     // 2. Itens da sessão: definem os produtos/dia que o modal precisa mostrar.
     const itens = await this.prisma.est_contagem_itens.findMany({
       where: { contagem_cuid: contagem.contagem_cuid },
-      select: { cod_produto: true, data: true }
+      select: { cod_produto: true, data: true, localizacao: true }
     });
 
     if (itens.length === 0) {
@@ -2116,6 +2156,15 @@ export class EstoqueSaidasRepository {
     //    Busca única pela faixa de datas + recorte por chave produto-dia em memória.
     const chaveDe = (cod: number, data: Date) => `${cod}-${data.toISOString().slice(0, 10)}`;
     const chavesDaSessao = new Set(itens.map(i => chaveDe(i.cod_produto, i.data)));
+    // Locações que ESTA sessão já cobre, por produto/dia: a sessão irmã só
+    // complementa com locação que a sessão aberta NÃO tem. Sem esse recorte, uma
+    // locação duplicada em duas sessões (dado antigo, hoje barrado na criação —
+    // ex.: avulsa e diária do mesmo produto no mesmo lugar) faria o modal somar
+    // as duas equipes na mesma locação.
+    const locKeyDe = (loc: string | null) => (loc ?? '').toUpperCase().trim();
+    const locacoesDaSessao = new Set(
+      itens.map(i => `${chaveDe(i.cod_produto, i.data)}|${locKeyDe(i.localizacao)}`),
+    );
     const codigos = [...new Set(itens.map(i => i.cod_produto))];
     let minIni: Date | null = null;
     let maxFim: Date | null = null;
@@ -2133,7 +2182,7 @@ export class EstoqueSaidasRepository {
         cod_produto: { in: codigos },
         data: { gte: minIni!, lte: maxFim! },
       },
-      select: { id: true, cod_produto: true, data: true, contagem_cuid: true },
+      select: { id: true, cod_produto: true, data: true, contagem_cuid: true, localizacao: true },
     });
 
     // Sessões canceladas ficam de fora — como na consolidação.
@@ -2147,7 +2196,15 @@ export class EstoqueSaidasRepository {
     const cuidsAtivos = new Set(sessoesAtivas.map(s => s.contagem_cuid).filter((c): c is string => !!c));
 
     const idsItens = todosItens
-      .filter(i => cuidsAtivos.has(i.contagem_cuid) && chavesDaSessao.has(chaveDe(i.cod_produto, i.data)))
+      .filter(i => {
+        const chave = chaveDe(i.cod_produto, i.data);
+        if (!chavesDaSessao.has(chave)) return false;
+        // Itens da própria sessão entram sempre.
+        if (i.contagem_cuid === contagem.contagem_cuid) return true;
+        if (!cuidsAtivos.has(i.contagem_cuid)) return false;
+        // Sessão irmã: só a locação que complementa (que esta sessão não tem).
+        return !locacoesDaSessao.has(`${chave}|${locKeyDe(i.localizacao)}`);
+      })
       .map(i => i.id);
 
     if (idsItens.length === 0) {
