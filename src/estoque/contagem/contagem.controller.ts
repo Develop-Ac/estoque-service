@@ -127,31 +127,27 @@ export class EstoqueSaidasController {
     };
     const empresa = q.empresa && String(q.empresa).trim() ? String(q.empresa).trim() : '3';
 
-    // "cod_produtos=123,456" -> [123, 456]; entradas não numéricas são descartadas.
-    const codProdutos = typeof q.cod_produtos === 'string' && q.cod_produtos.trim()
-      ? q.cod_produtos.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
-      : undefined;
+    // "123,456" -> [123, 456]; entradas não numéricas são descartadas. Os filtros
+    // de lista aceitam CSV (seleção múltipla na tela).
+    const toNums = (v: any): number[] | undefined =>
+      typeof v === 'string' && v.trim()
+        ? v.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+        : undefined;
 
     return this.service.buscarProdutosPorFiltro({
       empresa,
       cod_produto: toNum(q.cod_produto),
-      cod_produtos: codProdutos,
-      marca: toNum(q.marca),
+      cod_produtos: toNums(q.cod_produtos),
+      marcas: toNums(q.marca),
       descricao: typeof q.descricao === 'string' ? q.descricao : undefined,
-      grupo: toNum(q.grupo),
-      subgrupo: toNum(q.subgrupo),
+      grupos: toNums(q.grupo),
+      subgrupos: toNums(q.subgrupo),
       somente_com_saldo: toBool(q.somente_com_saldo, true),
-      // Piso/prateleira/coluna aceitam listas separadas por vírgula (seleção
-      // múltipla encadeada na tela da avulsa).
       pisos: typeof q.piso === 'string' && q.piso.trim()
         ? q.piso.split(',').map((s: string) => s.trim()).filter(Boolean)
         : undefined,
-      prateleiras: typeof q.prateleira === 'string' && String(q.prateleira).trim()
-        ? String(q.prateleira).split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
-        : undefined,
-      colunas: typeof q.coluna === 'string' && q.coluna.trim()
-        ? q.coluna.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
-        : undefined,
+      prateleiras: toNums(q.prateleira),
+      colunas: toNums(q.coluna),
     });
   }
 

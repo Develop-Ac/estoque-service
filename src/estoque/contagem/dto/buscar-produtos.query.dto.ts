@@ -29,28 +29,25 @@ export class BuscarProdutosQueryDto {
   @IsString()
   cod_produtos?: string;
 
-  @ApiProperty({ description: 'Código da marca (MAR_CODIGO)', example: 12, required: false })
+  @ApiProperty({ description: 'Código(s) da marca (MAR_CODIGO); aceita lista separada por vírgula', example: '12', required: false })
   @IsOptional()
-  @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))
-  @IsInt()
-  marca?: number;
+  @IsString()
+  marca?: string;
 
   @ApiProperty({ description: 'Descrição do produto (busca parcial)', example: 'CAPA', required: false })
   @IsOptional()
   @IsString()
   descricao?: string;
 
-  @ApiProperty({ description: 'Código do grupo (GRP_CODIGO)', example: 1, required: false })
+  @ApiProperty({ description: 'Código(s) do grupo (GRP_CODIGO); aceita lista separada por vírgula', example: '1', required: false })
   @IsOptional()
-  @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))
-  @IsInt()
-  grupo?: number;
+  @IsString()
+  grupo?: string;
 
-  @ApiProperty({ description: 'Código do subgrupo (SUBGRP_CODIGO)', example: 3, required: false })
+  @ApiProperty({ description: 'Código(s) do subgrupo (SUBGRP_CODIGO); aceita lista separada por vírgula', example: '3', required: false })
   @IsOptional()
-  @Transform(({ value }) => (value === undefined || value === '' ? undefined : Number(value)))
-  @IsInt()
-  subgrupo?: number;
+  @IsString()
+  subgrupo?: string;
 
   @ApiProperty({
     description: 'Quando true, retorna apenas produtos com saldo (disponível + reservado > 0)',

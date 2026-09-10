@@ -27,9 +27,12 @@ export class EstoqueSaidasService {
     cod_produto?: number;
     cod_produtos?: number[];
     marca?: number;
+    marcas?: number[];
     descricao?: string;
     grupo?: number;
+    grupos?: number[];
     subgrupo?: number;
+    subgrupos?: number[];
     somente_com_saldo?: boolean;
     piso?: string;
     prateleira?: number;

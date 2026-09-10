@@ -47,6 +47,10 @@ export interface FiltroProdutos {
   marca?: number;
   grupo?: number;
   subgrupo?: number;
+  /** Versões multi-seleção (viram `:em:` — funciona também na relação grupo.GRP_CODIGO). */
+  marcas?: number[];
+  grupos?: number[];
+  subgrupos?: number[];
   descricao?: string;
 }
 
@@ -286,9 +290,12 @@ export class ErpApiService {
     // precisam ir num único `em` — N chamadas unitárias viram N consultas reais
     // no Firebird disputando o pool.
     if (f.cod_produtos?.length) filtros.push(`PRO_CODIGO:em:${f.cod_produtos.join(',')}`);
-    if (f.marca != null) filtros.push(`MAR_CODIGO:igual:${f.marca}`);
-    if (f.subgrupo != null) filtros.push(`SUBGRP_CODIGO:igual:${f.subgrupo}`);
-    if (f.grupo != null) filtros.push(`grupo.GRP_CODIGO:igual:${f.grupo}`);
+    if (f.marcas?.length) filtros.push(`MAR_CODIGO:em:${f.marcas.join(',')}`);
+    else if (f.marca != null) filtros.push(`MAR_CODIGO:igual:${f.marca}`);
+    if (f.subgrupos?.length) filtros.push(`SUBGRP_CODIGO:em:${f.subgrupos.join(',')}`);
+    else if (f.subgrupo != null) filtros.push(`SUBGRP_CODIGO:igual:${f.subgrupo}`);
+    if (f.grupos?.length) filtros.push(`grupo.GRP_CODIGO:em:${f.grupos.join(',')}`);
+    else if (f.grupo != null) filtros.push(`grupo.GRP_CODIGO:igual:${f.grupo}`);
     if (f.descricao) filtros.push(`PRO_DESCRICAO:contem:${f.descricao}`);
 
     return this.pedir(

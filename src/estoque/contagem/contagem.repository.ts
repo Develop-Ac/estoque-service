@@ -445,11 +445,19 @@ export class EstoqueSaidasRepository {
     piso?: string;         // PISO_A, PISO_B, BOX, VITRINE... (recorte pós-explode)
     prateleira?: number;   // dois dígitos após a letra do piso (recorte pós-explode)
     // Seleção múltipla (a tela manda listas; os campos singulares seguem aceitos):
+    marcas?: number[];
+    grupos?: number[];
+    subgrupos?: number[];
     pisos?: string[];
     prateleiras?: number[];
     colunas?: number[];    // prédio/coluna: os 2 dígitos após a prateleira
   }): Promise<EstoqueSaidaRow[]> {
     // Normaliza singular -> lista: o recorte é sempre por conjunto.
+    const soInteiros = (ns: Array<number | undefined | null>) =>
+      [...new Set(ns.filter((n): n is number => n != null && Number.isFinite(n)))];
+    const marcas = soInteiros([...(params.marcas ?? []), params.marca]);
+    const grupos = soInteiros([...(params.grupos ?? []), params.grupo]);
+    const subgrupos = soInteiros([...(params.subgrupos ?? []), params.subgrupo]);
     const pisos = (params.pisos ?? ((params.piso ?? '').trim() ? [params.piso!.trim()] : []))
       .map((p) => p.trim())
       .filter(Boolean);
@@ -459,10 +467,15 @@ export class EstoqueSaidasRepository {
     );
     const colunas = new Set((params.colunas ?? []).filter((n) => Number.isFinite(n)));
 
-    const rows = await this.erpApi.comFallback(
+    const baseParams = {
+      ...params,
+      marcas, grupos, subgrupos,
       // `piso` singular repassado só para a validação de "tem filtro" dos dois caminhos.
-      () => this.fetchProdutosPorFiltroViaApi({ ...params, piso: pisos[0] ?? params.piso }),
-      () => this.fetchProdutosPorFiltroViaOpenQuery({ ...params, piso: pisos[0] ?? params.piso }),
+      piso: pisos[0] ?? params.piso,
+    };
+    const rows = await this.erpApi.comFallback(
+      () => this.fetchProdutosPorFiltroViaApi(baseParams),
+      () => this.fetchProdutosPorFiltroViaOpenQuery(baseParams),
     );
 
     // Piso, prateleira e coluna são atributos da LOCAÇÃO, não do produto: só dá para
@@ -493,10 +506,10 @@ export class EstoqueSaidasRepository {
     empresa: string;
     cod_produto?: number;
     cod_produtos?: number[];
-    marca?: number;
+    marcas?: number[];
     descricao?: string;
-    grupo?: number;
-    subgrupo?: number;
+    grupos?: number[];
+    subgrupos?: number[];
     somente_com_saldo?: boolean;
     piso?: string;
   }): Promise<EstoqueSaidaRow[]> {
@@ -514,15 +527,15 @@ export class EstoqueSaidasRepository {
       [cod_produto, ...(params.cod_produtos ?? []).map(toInt)]
         .filter((c): c is number => c != null),
     )];
-    const marca = toInt(params.marca);
-    const grupo = toInt(params.grupo);
-    const subgrupo = toInt(params.subgrupo);
+    const marcas = params.marcas ?? [];
+    const grupos = params.grupos ?? [];
+    const subgrupos = params.subgrupos ?? [];
     const descricao = (params.descricao ?? '').trim().toUpperCase();
     // Piso conta como filtro: o recorte acontece pós-explode (no wrapper), mas a busca
     // "só por piso" é legítima — traz o catálogo com saldo e filtra as locações.
     const temPiso = (params.piso ?? '').trim().length > 0;
 
-    if (codigos.length === 0 && marca == null && grupo == null && subgrupo == null && !descricao && !temPiso) {
+    if (codigos.length === 0 && marcas.length === 0 && grupos.length === 0 && subgrupos.length === 0 && !descricao && !temPiso) {
       throw new BadRequestException(
         'Informe ao menos um filtro (grupo, subgrupo, marca, descrição, código ou piso) para a contagem avulsa.'
       );
@@ -540,14 +553,14 @@ export class EstoqueSaidasRepository {
         const parte = await this.erpApi.produtosPorFiltro({
           empresa,
           cod_produtos: codigos.slice(i, i + LOTE_EM),
-          marca, grupo, subgrupo,
+          marcas, grupos, subgrupos,
           descricao: descricao || undefined,
         });
         linhas.push(...parte);
       }
     } else {
       linhas = await this.erpApi.produtosPorFiltro({
-        empresa, marca, grupo, subgrupo, descricao: descricao || undefined,
+        empresa, marcas, grupos, subgrupos, descricao: descricao || undefined,
       });
     }
 
@@ -575,10 +588,10 @@ export class EstoqueSaidasRepository {
     empresa: string;       // '3' por default
     cod_produto?: number;
     cod_produtos?: number[];
-    marca?: number;        // MAR_CODIGO
+    marcas?: number[];     // MAR_CODIGO
     descricao?: string;    // LIKE em PRO.pro_descricao
-    grupo?: number;        // GRP_CODIGO
-    subgrupo?: number;     // SUBGRP_CODIGO
+    grupos?: number[];     // GRP_CODIGO
+    subgrupos?: number[];  // SUBGRP_CODIGO
     somente_com_saldo?: boolean; // (disponivel + reservado) > 0
     piso?: string;
   }): Promise<EstoqueSaidaRow[]> {
@@ -601,15 +614,16 @@ export class EstoqueSaidasRepository {
       [codProduto, ...(params.cod_produtos ?? []).map(toInt)]
         .filter((c): c is number => c != null),
     )];
-    const marca = toInt(params.marca);
-    const grupo = toInt(params.grupo);
-    const subgrupo = toInt(params.subgrupo);
+    // Só inteiros entram no literal Firebird.
+    const marcas = (params.marcas ?? []).map(toInt).filter((n): n is number => n != null);
+    const grupos = (params.grupos ?? []).map(toInt).filter((n): n is number => n != null);
+    const subgrupos = (params.subgrupos ?? []).map(toInt).filter((n): n is number => n != null);
 
     // Descrição: remove aspas simples (evita quebra do literal Firebird) e normaliza.
     const descricao = (params.descricao ?? '').replace(/'/g, '').trim().toUpperCase();
 
     const temFiltro =
-      codigos.length > 0 || marca != null || grupo != null || subgrupo != null ||
+      codigos.length > 0 || marcas.length > 0 || grupos.length > 0 || subgrupos.length > 0 ||
       descricao.length > 0 || (params.piso ?? '').trim().length > 0;
     if (!temFiltro) {
       throw new BadRequestException(
@@ -620,9 +634,9 @@ export class EstoqueSaidasRepository {
     const where: string[] = [`WHERE PRO.empresa = '${empresa}'`];
     if (codigos.length === 1) where.push(`AND PRO.pro_codigo = ${codigos[0]}`);
     else if (codigos.length > 1) where.push(`AND PRO.pro_codigo IN (${codigos.join(', ')})`);
-    if (marca != null) where.push(`AND PRO.mar_codigo = ${marca}`);
-    if (grupo != null) where.push(`AND SG.grp_codigo = ${grupo}`);
-    if (subgrupo != null) where.push(`AND PRO.subgrp_codigo = ${subgrupo}`);
+    if (marcas.length > 0) where.push(`AND PRO.mar_codigo IN (${marcas.join(', ')})`);
+    if (grupos.length > 0) where.push(`AND SG.grp_codigo IN (${grupos.join(', ')})`);
+    if (subgrupos.length > 0) where.push(`AND PRO.subgrp_codigo IN (${subgrupos.join(', ')})`);
     if (descricao.length > 0) where.push(`AND UPPER(PRO.pro_descricao) LIKE '%${descricao}%'`);
     if (params.somente_com_saldo) {
       where.push(`AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0`);
