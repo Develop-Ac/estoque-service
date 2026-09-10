@@ -58,6 +58,17 @@ export class EstoqueSaidasService {
     return this.repo.fetchColunasPorFiltro(empresa, piso, prateleira);
   }
 
+  /** Marcas com produto dentro do recorte atual (encadeia o filtro de marca). */
+  async listarMarcasPorRecorte(empresa: string, filtros: {
+    grupos?: number[];
+    subgrupos?: number[];
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];
+  }) {
+    return this.repo.fetchMarcasPorRecorte(empresa, filtros);
+  }
+
   async listarGrupos(empresa: string) {
     return this.repo.fetchGrupos(empresa);
   }

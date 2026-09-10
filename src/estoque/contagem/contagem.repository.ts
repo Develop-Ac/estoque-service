@@ -753,47 +753,117 @@ export class EstoqueSaidasRepository {
     }));
   }
 
-  // Cache da varredura de locações (para o filtro-filho de prateleiras): a lista de
-  // locações do catálogo muda devagar e a varredura é uma ida cara ao Firebird.
-  private locacoesCatalogoCache: { empresa: string; expiraEm: number; locacoes: string[] } | null = null;
+  // Cache da varredura do catálogo com saldo — base de TODOS os filtros
+  // encadeados (prateleiras, colunas e marcas do recorte). Cada linha é um
+  // produto com suas locações explodidas, marca e subgrupo; muda devagar e a
+  // varredura é uma ida cara ao Firebird.
+  private catalogoComSaldoCache: {
+    empresa: string;
+    expiraEm: number;
+    produtos: Array<{ locs: string[]; marca: number | null; subgrupo: number | null }>;
+  } | null = null;
 
-  /** Locações do catálogo com saldo (cache de 5 min) — base dos filtros encadeados. */
-  private async getLocacoesComSaldo(empresa: string): Promise<string[]> {
+  private async getCatalogoComSaldo(
+    empresa: string,
+  ): Promise<Array<{ locs: string[]; marca: number | null; subgrupo: number | null }>> {
     if (!/^\d+$/.test(empresa)) throw new BadRequestException('Empresa inválida');
 
     const agora = Date.now();
     if (
-      this.locacoesCatalogoCache &&
-      this.locacoesCatalogoCache.empresa === empresa &&
-      this.locacoesCatalogoCache.expiraEm > agora
+      this.catalogoComSaldoCache &&
+      this.catalogoComSaldoCache.empresa === empresa &&
+      this.catalogoComSaldoCache.expiraEm > agora
     ) {
-      return this.locacoesCatalogoCache.locacoes;
+      return this.catalogoComSaldoCache.produtos;
     }
 
     const innerSql = [
-      'SELECT PRO.localizacao, PRO.aplicacoes',
+      'SELECT PRO.localizacao, PRO.aplicacoes, PRO.mar_codigo, PRO.subgrp_codigo',
       'FROM PRODUTOS PRO',
       `WHERE PRO.empresa = '${empresa}'`,
       'AND (COALESCE(PRO.estoque_disponivel,0) + COALESCE(PRO.estoque_reservado,0)) > 0',
     ].join('\n');
     const innerEscaped = innerSql.replace(/'/g, "''");
-    const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any }>(
-      `/* locacoes-catalogo OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
+    const rows = await this.oq.query<{ LOCALIZACAO: any; APLICACOES: any; MAR_CODIGO: any; SUBGRP_CODIGO: any }>(
+      `/* catalogo-com-saldo OPENQUERY */ SELECT * FROM OPENQUERY(CONSULTA, '${innerEscaped}');`,
       {},
       { timeout: 120_000 },
     );
 
-    const set = new Set<string>();
-    for (const row of rows ?? []) {
+    const produtos = (rows ?? []).map((row) => {
       const rawLoc = this.toUtf8Text((row as any).LOCALIZACAO);
       const rawApp = this.toUtf8Text((row as any).APLICACOES);
       const principais = extractLocations(rawLoc);
-      for (const l of principais.length ? principais : (rawLoc ? [rawLoc] : [])) set.add(l);
-      for (const l of extractLocations(rawApp)) set.add(l);
+      const locs = [...new Set([
+        ...(principais.length ? principais : (rawLoc ? [rawLoc] : [])),
+        ...extractLocations(rawApp),
+      ])];
+      const marca = Number((row as any).MAR_CODIGO);
+      const subgrupo = Number((row as any).SUBGRP_CODIGO);
+      return {
+        locs,
+        marca: Number.isFinite(marca) ? marca : null,
+        subgrupo: Number.isFinite(subgrupo) ? subgrupo : null,
+      };
+    });
+    this.catalogoComSaldoCache = { empresa, expiraEm: agora + 5 * 60_000, produtos };
+    return produtos;
+  }
+
+  /** Locações do catálogo com saldo, achatadas — consumo de prateleiras/colunas. */
+  private async getLocacoesComSaldo(empresa: string): Promise<string[]> {
+    const produtos = await this.getCatalogoComSaldo(empresa);
+    return [...new Set(produtos.flatMap((p) => p.locs))];
+  }
+
+  /**
+   * Marcas com produto (com saldo) dentro do recorte atual dos filtros da avulsa —
+   * encadeia o filtro de marca a grupo/subgrupo e/ou piso/prateleira/coluna.
+   * Grupo vira subgrupos pela taxonomia (PRODUTOS só tem SUBGRP_CODIGO).
+   * Devolve só os códigos: a tela já tem as descrições da lista completa.
+   */
+  async fetchMarcasPorRecorte(empresa: string, filtros: {
+    grupos?: number[];
+    subgrupos?: number[];
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];
+  }): Promise<number[]> {
+    const grupos = filtros.grupos ?? [];
+    const subgruposSel = new Set(filtros.subgrupos ?? []);
+    if (grupos.length > 0 && subgruposSel.size === 0) {
+      const todos = await this.fetchSubgrupos(empresa);
+      for (const s of todos) if (grupos.includes(s.GRP_CODIGO)) subgruposSel.add(s.SUBGRP_CODIGO);
+      if (subgruposSel.size === 0) return [];
     }
-    const locacoes = [...set];
-    this.locacoesCatalogoCache = { empresa, expiraEm: agora + 5 * 60_000, locacoes };
-    return locacoes;
+    const pisos = filtros.pisos ?? [];
+    const prateleiras = new Set(filtros.prateleiras ?? []);
+    const colunas = new Set(filtros.colunas ?? []);
+
+    const produtos = await this.getCatalogoComSaldo(empresa);
+    const marcas = new Set<number>();
+    for (const p of produtos) {
+      if (p.marca == null) continue;
+      if (subgruposSel.size > 0 && (p.subgrupo == null || !subgruposSel.has(p.subgrupo))) continue;
+      if (pisos.length > 0) {
+        // Piso, prateleira e coluna precisam casar na MESMA locação do produto.
+        const casa = p.locs.some((loc) => {
+          if (!pisos.some((pi) => locacaoPertenceAoPiso(loc, pi))) return false;
+          if (prateleiras.size > 0) {
+            const pr = extrairPrateleira(loc);
+            if (pr == null || !prateleiras.has(pr)) return false;
+          }
+          if (colunas.size > 0) {
+            const c = extrairColuna(loc);
+            if (c == null || !colunas.has(c)) return false;
+          }
+          return true;
+        });
+        if (!casa) continue;
+      }
+      marcas.add(p.marca);
+    }
+    return [...marcas].sort((a, b) => a - b);
   }
 
   /**

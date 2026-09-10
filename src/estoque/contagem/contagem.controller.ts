@@ -182,6 +182,38 @@ export class EstoqueSaidasController {
     return this.service.listarColunas(empresa, piso, prateleira);
   }
 
+  @Get('marcas-recorte')
+  @ApiOperation({
+    summary: 'Marcas existentes no recorte dos filtros da avulsa (encadeia o filtro de marca)',
+    description:
+      'Códigos de marca (MAR_CODIGO) com produto com saldo dentro do recorte de grupos, subgrupos ' +
+      'e/ou piso/prateleira/coluna. Todos os parâmetros aceitam lista separada por vírgula.'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'grupo', required: false, example: '1,4', type: 'string' })
+  @ApiQuery({ name: 'subgrupo', required: false, example: '154', type: 'string' })
+  @ApiQuery({ name: 'piso', required: false, example: 'PISO_A,BOX', type: 'string' })
+  @ApiQuery({ name: 'prateleira', required: false, example: '12,14', type: 'string' })
+  @ApiQuery({ name: 'coluna', required: false, example: '3', type: 'string' })
+  async getMarcasRecorte(
+    @Query('empresa') empresa = '3',
+    @Query('grupo') grupo = '',
+    @Query('subgrupo') subgrupo = '',
+    @Query('piso') piso = '',
+    @Query('prateleira') prateleira = '',
+    @Query('coluna') coluna = '',
+  ) {
+    const nums = (v: string) =>
+      v.split(',').map((s) => s.trim()).filter(Boolean).map(Number).filter((n) => Number.isFinite(n));
+    return this.service.listarMarcasPorRecorte(empresa, {
+      grupos: grupo.trim() ? nums(grupo) : undefined,
+      subgrupos: subgrupo.trim() ? nums(subgrupo) : undefined,
+      pisos: piso.trim() ? piso.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      prateleiras: prateleira.trim() ? nums(prateleira) : undefined,
+      colunas: coluna.trim() ? nums(coluna) : undefined,
+    });
+  }
+
   @Get('pendentes')
   @ApiOperation({
     summary: 'Listar itens pendentes de contagens avulsas',
