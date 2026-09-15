@@ -164,11 +164,12 @@ export class AuditoriaService {
                 }
             });
 
-            // CONSOLIDAÇÃO POR PRODUTO/DIA (todas as locações, de todas as sessões).
+            // CONSOLIDAÇÃO POR PRODUTO/DIA (todas as locações, de todas as sessões
+            // DIÁRIAS — a avulsa do mesmo produto/dia é outra contagem e não entra).
             // É o que resolve o produto multilocação: a locação A pode ter fechado certo
             // na 1ª contagem e a locação B só ter aparecido depois — a auditoria precisa
             // enxergar a soma das locações, não cada sessão isoladamente.
-            const consolidado = await consolidarProdutoDia(this.prisma, cod_produto, firstItem.data);
+            const consolidado = await consolidarProdutoDia(this.prisma, cod_produto, firstItem.data, 1);
 
             // Calcular saldo snapshot
             // CORREÇÃO: O saldo 'estoque' em cada item já é o saldo TOTAL do sistema naquele momento.
@@ -619,7 +620,8 @@ export class AuditoriaService {
         const result: any[] = [];
 
         for (const grupo of grupos.values()) {
-            const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data);
+            // Só sessões AVULSAS: uma diária do mesmo produto/dia é outra contagem.
+            const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data, 2);
             if (!consolidado) continue;
 
             const cuidsEnvolvidos = consolidado.cuids;

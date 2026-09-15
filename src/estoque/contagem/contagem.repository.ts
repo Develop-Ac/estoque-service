@@ -1219,6 +1219,9 @@ export class EstoqueSaidasRepository {
         // adoção de fantasmas (avulsa) e a validação de locação duplicada (todos os
         // tipos). Busca única cobrindo o intervalo de datas; o recorte por produto/dia
         // usa a mesma chave `${cod}-${yyyy-mm-dd}` do agrupamento acima.
+        // Só sessões da MESMA NATUREZA contam: diária e avulsa são contagens
+        // independentes (a consolidação também separa por tipo), então um produto pode
+        // viver na diária e numa avulsa no mesmo dia e locação sem conflito.
         type ItemExistente = {
           id: string;
           localizacao: string | null;
@@ -1256,7 +1259,7 @@ export class EstoqueSaidasRepository {
           if (existentesTodos.length > 0) {
             const cuidsExistentes = [...new Set(existentesTodos.map((e) => e.contagem_cuid))];
             const sessoesAtivas = await tx.est_contagem.findMany({
-              where: { contagem_cuid: { in: cuidsExistentes }, status: 0 },
+              where: { contagem_cuid: { in: cuidsExistentes }, status: 0, tipo: tipo ?? 1 },
               select: { contagem_cuid: true, piso: true },
             });
             for (const s of sessoesAtivas) {
@@ -1281,9 +1284,10 @@ export class EstoqueSaidasRepository {
         }
 
         // VALIDAÇÃO DE LOCAÇÃO DUPLICADA: um produto/dia/locação só pode viver em UMA
-        // sessão ativa. Se a mesma locação entrar em duas sessões (ex.: avulsa e diária
-        // do mesmo produto no mesmo dia), a consolidação por produto/dia soma as duas
-        // equipes em cada rodada e acusa divergência falsa numa contagem correta.
+        // sessão ativa da mesma natureza. Se a mesma locação entrar em duas diárias (ou
+        // duas avulsas) do mesmo produto no mesmo dia, a consolidação por produto/dia
+        // soma as duas equipes em cada rodada e acusa divergência falsa numa contagem
+        // correta. Diária x avulsa não conflitam: são consolidadas separadamente.
         // Fantasma pendente sem contagem não é conflito para a AVULSA — é adoção.
         const conflitos: string[] = [];
         for (const [chaveBase, produtosDoGrupo] of gruposPorProduto) {
@@ -1308,7 +1312,7 @@ export class EstoqueSaidasRepository {
         if (conflitos.length > 0) {
           const amostra = conflitos.slice(0, 10).join('; ');
           throw new BadRequestException(
-            `${conflitos.length} produto(s) da seleção já estão em outra contagem ativa no mesmo dia e locação: ${amostra}` +
+            `${conflitos.length} produto(s) da seleção já estão em outra contagem ${ehAvulsa ? 'avulsa' : 'diária'} ativa no mesmo dia e locação: ${amostra}` +
             `${conflitos.length > 10 ? '…' : ''}. ` +
             'Remova-os da seleção ou conclua/cancele a outra contagem antes — a mesma locação em duas contagens somaria as duas equipes na validação e acusaria divergência falsa.',
           );
@@ -1685,6 +1689,7 @@ export class EstoqueSaidasRepository {
       this.prisma,
       contagemItem.cod_produto,
       contagemItem.data,
+      parentContagem?.tipo ?? 1,
       { estoqueReferencia: estoqueRealtime },
     );
 
@@ -2076,6 +2081,13 @@ export class EstoqueSaidasRepository {
       return { algumProdutoDivergente: false, temItens: false };
     }
 
+    // Natureza da sessão: a consolidação só soma sessões do mesmo tipo.
+    const sessao = await this.prisma.est_contagem.findFirst({
+      where: { contagem_cuid },
+      select: { tipo: true },
+    });
+    const tipoSessao = sessao?.tipo ?? 1;
+
     // Agrupa as locações desta sessão por produto/dia (a chave usada na consolidação).
     const grupos = new Map<string, { cod_produto: number; data: Date; itensIds: string[] }>();
     for (const item of itens) {
@@ -2089,7 +2101,7 @@ export class EstoqueSaidasRepository {
     const cuidsIrmaos = new Set<string>();
 
     for (const grupo of grupos.values()) {
-      const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data);
+      const consolidado = await consolidarProdutoDia(this.prisma, grupo.cod_produto, grupo.data, tipoSessao);
       if (!consolidado) continue;
 
       if (consolidado.correto) {
@@ -2214,7 +2226,7 @@ export class EstoqueSaidasRepository {
     // 1. Buscar a contagem para obter o CUID
     const contagem = await this.prisma.est_contagem.findUnique({
       where: { id: contagemId },
-      select: { contagem_cuid: true }
+      select: { contagem_cuid: true, tipo: true }
     });
 
     if (!contagem || !contagem.contagem_cuid) {
@@ -2236,15 +2248,15 @@ export class EstoqueSaidasRepository {
     //    buscar logs pelo identificador desta sessão deixaria de fora as locações
     //    contadas nas irmãs. A visão do modal precisa da mesma abrangência da
     //    consolidação que valida o produto: TODOS os itens ativos do produto/dia,
-    //    de todas as sessões — é a soma deles que fecha (ou não) com o estoque.
+    //    de todas as sessões da MESMA NATUREZA (diária x avulsa não se somam) — é a
+    //    soma deles que fecha (ou não) com o estoque.
     //    Busca única pela faixa de datas + recorte por chave produto-dia em memória.
     const chaveDe = (cod: number, data: Date) => `${cod}-${data.toISOString().slice(0, 10)}`;
     const chavesDaSessao = new Set(itens.map(i => chaveDe(i.cod_produto, i.data)));
     // Locações que ESTA sessão já cobre, por produto/dia: a sessão irmã só
     // complementa com locação que a sessão aberta NÃO tem. Sem esse recorte, uma
-    // locação duplicada em duas sessões (dado antigo, hoje barrado na criação —
-    // ex.: avulsa e diária do mesmo produto no mesmo lugar) faria o modal somar
-    // as duas equipes na mesma locação.
+    // locação duplicada em duas sessões da mesma natureza (dado antigo, hoje
+    // barrado na criação) faria o modal somar as duas equipes na mesma locação.
     const locKeyDe = (loc: string | null) => (loc ?? '').toUpperCase().trim();
     const locacoesDaSessao = new Set(
       itens.map(i => `${chaveDe(i.cod_produto, i.data)}|${locKeyDe(i.localizacao)}`),
@@ -2269,11 +2281,11 @@ export class EstoqueSaidasRepository {
       select: { id: true, cod_produto: true, data: true, contagem_cuid: true, localizacao: true },
     });
 
-    // Sessões canceladas ficam de fora — como na consolidação.
+    // Sessões canceladas e de outra natureza ficam de fora — como na consolidação.
     const cuidsEnvolvidos = [...new Set(todosItens.map(i => i.contagem_cuid).filter((c): c is string => !!c))];
     const sessoesAtivas = cuidsEnvolvidos.length
       ? await this.prisma.est_contagem.findMany({
-        where: { contagem_cuid: { in: cuidsEnvolvidos }, status: 0 },
+        where: { contagem_cuid: { in: cuidsEnvolvidos }, status: 0, tipo: contagem.tipo },
         select: { contagem_cuid: true },
       })
       : [];

@@ -14,8 +14,13 @@ import { PrismaService } from '../../prisma/prisma.service';
  *   - o resultado era um produto com a 1ª contagem correta e a 2ª/3ª "erradas" caindo
  *     na auditoria.
  *
- * Este helper olha o produto/dia INTEIRO (todas as locações, de todas as sessões ativas)
- * e responde se ele já foi contado corretamente.
+ * Este helper olha o produto/dia INTEIRO (todas as locações, de todas as sessões ativas
+ * DA MESMA NATUREZA) e responde se ele já foi contado corretamente.
+ *
+ * NATUREZAS NÃO SE MISTURAM: diária (tipo 1) e avulsa (tipo 2) são contagens
+ * independentes. Um produto com movimentação cai na diária mesmo estando numa avulsa
+ * aberta no mesmo dia; cada natureza soma só as suas locações contra o estoque total e
+ * valida sozinha. Somar as duas dobraria a contagem e acusaria divergência falsa.
  *
  * REGRA: rodadas NÃO se misturam. A validação soma 1ª com 1ª, 2ª com 2ª e 3ª com 3ª —
  * nunca a 3ª de uma locação com a 2ª de outra. O produto só fecha quando UMA rodada
@@ -99,7 +104,9 @@ function rodadaValida(valor: number): valor is Rodada {
 /**
  * Monta a visão consolidada de um produto/dia.
  *
- * @param estoqueReferencia força o estoque usado na comparação (ex.: valor recém-buscado
+ * @param tipo natureza da sessão validada (1 = diária, 2 = avulsa): só sessões ativas
+ *        desse tipo entram na soma.
+ * @param opts.estoqueReferencia força o estoque usado na comparação (ex.: valor recém-buscado
  *        em tempo real no ERP). Quando omitido, usa o maior snapshot gravado nos itens —
  *        e, se todos estiverem zerados, o maior snapshot gravado nos logs. Escolher o
  *        MAIOR é o lado seguro: na dúvida o produto continua sendo tratado como divergente
@@ -111,6 +118,7 @@ export async function consolidarProdutoDia(
     prisma: PrismaService,
     codProduto: number,
     data: Date,
+    tipo: number,
     opts: { estoqueReferencia?: number } = {},
 ): Promise<ConsolidadoProdutoDia | null> {
     const { inicio, fim } = limitesDoDia(data);
@@ -133,11 +141,12 @@ export async function consolidarProdutoDia(
     if (itens.length === 0) return null;
 
     // Sessões canceladas (status != 0) não representam locação que alguém ainda vai
-    // contar — se entrassem na conta, o produto nunca fecharia.
+    // contar — se entrassem na conta, o produto nunca fecharia. Sessões de OUTRA
+    // natureza (diária x avulsa) são contagens independentes e também ficam de fora.
     const cuids = [...new Set(itens.map(i => i.contagem_cuid).filter((c): c is string => !!c))];
     const sessoesAtivas = cuids.length
         ? await prisma.est_contagem.findMany({
-            where: { contagem_cuid: { in: cuids }, status: 0 },
+            where: { contagem_cuid: { in: cuids }, status: 0, tipo },
             select: { contagem_cuid: true },
         })
         : [];

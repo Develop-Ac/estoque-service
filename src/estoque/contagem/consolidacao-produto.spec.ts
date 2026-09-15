@@ -50,6 +50,20 @@ describe('consolidarProdutoDia', () => {
         } as unknown as PrismaService;
     }
 
+    it('só soma sessões da mesma natureza: a busca de sessões ativas filtra pelo tipo', async () => {
+        const prisma = montarPrisma({
+            itens: [ITEM_C13],
+            cuidsAtivos: ['sessao-A'],
+            logs: [{ item_id: 'item-c13', contado: 18, rodada: 1 }],
+        });
+
+        await consolidarProdutoDia(prisma, 38677, DATA, 2);
+
+        expect(prisma.est_contagem.findMany).toHaveBeenCalledWith(
+            expect.objectContaining({ where: expect.objectContaining({ status: 0, tipo: 2 }) }),
+        );
+    });
+
     it('dá o produto como correto quando uma rodada inteira fecha somando as duas locações', async () => {
         const prisma = montarPrisma({
             itens: [ITEM_C13, ITEM_VM],
@@ -63,7 +77,7 @@ describe('consolidarProdutoDia', () => {
             ],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado).not.toBeNull();
         expect(consolidado!.estoque_referencia).toBe(18);
@@ -88,7 +102,7 @@ describe('consolidarProdutoDia', () => {
             ],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.rodadas[1].cobertura_total).toBe(false);
         expect(consolidado!.rodadas[3].cobertura_total).toBe(false);
@@ -109,7 +123,7 @@ describe('consolidarProdutoDia', () => {
             ],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.rodadas[1].cobertura_total).toBe(true);
         expect(consolidado!.rodadas[1].total).toBe(15);
@@ -124,7 +138,7 @@ describe('consolidarProdutoDia', () => {
             logs: [{ item_id: 'item-c13', contado: 18, rodada: 1 }],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.todas_locacoes_contadas).toBe(false);
         expect(consolidado!.rodadas[1].cobertura_total).toBe(false);
@@ -138,7 +152,7 @@ describe('consolidarProdutoDia', () => {
             logs: [{ item_id: 'item-c13', contado: 18, rodada: 1 }],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.locacoes).toHaveLength(1);
         expect(consolidado!.rodadas[1].bate).toBe(true);
@@ -155,7 +169,7 @@ describe('consolidarProdutoDia', () => {
             ],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.rodadas[1].total).toBe(18);
         expect(consolidado!.correto).toBe(true);
@@ -170,7 +184,7 @@ describe('consolidarProdutoDia', () => {
             logs: [{ item_id: 'item-c13', contado: 20, rodada: 1, estoque: 20 }],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, { estoqueReferencia: 20 });
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1, { estoqueReferencia: 20 });
 
         expect(consolidado!.estoque_referencia).toBe(20);
         expect(consolidado!.rodadas[1].bate).toBe(true);
@@ -186,7 +200,7 @@ describe('consolidarProdutoDia', () => {
             logs: [{ item_id: 'item-c13', contado: 18, rodada: 1, estoque: 18 }],
         });
 
-        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA);
+        const consolidado = await consolidarProdutoDia(prisma, 38677, DATA, 1);
 
         expect(consolidado!.estoque_referencia).toBe(15);
         expect(consolidado!.rodadas[1].estoque_referencia).toBe(18);
@@ -197,6 +211,6 @@ describe('consolidarProdutoDia', () => {
     it('retorna null quando não há item do produto no dia', async () => {
         const prisma = montarPrisma({ itens: [], cuidsAtivos: [], logs: [] });
 
-        expect(await consolidarProdutoDia(prisma, 38677, DATA)).toBeNull();
+        expect(await consolidarProdutoDia(prisma, 38677, DATA, 1)).toBeNull();
     });
 });
