@@ -128,15 +128,103 @@ export class EstoqueSaidasController {
     };
     const empresa = q.empresa && String(q.empresa).trim() ? String(q.empresa).trim() : '3';
 
+    // "123,456" -> [123, 456]; entradas não numéricas são descartadas. Os filtros
+    // de lista aceitam CSV (seleção múltipla na tela).
+    const toNums = (v: any): number[] | undefined =>
+      typeof v === 'string' && v.trim()
+        ? v.split(',').map((c) => toNum(c)).filter((c): c is number => c != null)
+        : undefined;
+
     return this.service.buscarProdutosPorFiltro({
       empresa,
       cod_produto: toNum(q.cod_produto),
-      marca: toNum(q.marca),
+      cod_produtos: toNums(q.cod_produtos),
+      marcas: toNums(q.marca),
       descricao: typeof q.descricao === 'string' ? q.descricao : undefined,
-      grupo: toNum(q.grupo),
-      subgrupo: toNum(q.subgrupo),
+      grupos: toNums(q.grupo),
+      subgrupos: toNums(q.subgrupo),
       somente_com_saldo: toBool(q.somente_com_saldo, true),
+      pisos: typeof q.piso === 'string' && q.piso.trim()
+        ? q.piso.split(',').map((s: string) => s.trim()).filter(Boolean)
+        : undefined,
+      prateleiras: toNums(q.prateleira),
+      colunas: toNums(q.coluna),
     });
+  }
+
+  @Get('prateleiras')
+  @ApiOperation({
+    summary: 'Listar prateleiras de um piso (filtro-filho da avulsa)',
+    description:
+      'Prateleiras/ruas existentes no piso informado, extraídas do catálogo de produtos com saldo. ' +
+      'A prateleira é o bloco de dígitos da locação menos os 2 do prédio (1-9 sem zero à esquerda: A903B02 -> 9, A1403A03 -> 14).'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', description: 'Aceita lista separada por vírgula (PISO_A,BOX)', type: 'string' })
+  async getPrateleiras(@Query('empresa') empresa = '3', @Query('piso') piso = '') {
+    return this.service.listarPrateleiras(empresa, piso);
+  }
+
+  @Get('colunas')
+  @ApiOperation({
+    summary: 'Listar colunas (prédio) dos pisos/prateleiras (3º nível do filtro da avulsa)',
+    description:
+      'Colunas/prédios existentes nas locações dos pisos e prateleiras informados, extraídas do catálogo ' +
+      'de produtos com saldo. A coluna são os 2 dígitos após a prateleira (A1403A03 -> 3).'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'piso', required: true, example: 'PISO_A', description: 'Aceita lista separada por vírgula', type: 'string' })
+  @ApiQuery({ name: 'prateleira', required: false, example: '12,14', description: 'Aceita lista separada por vírgula; vazio = todas', type: 'string' })
+  async getColunas(
+    @Query('empresa') empresa = '3',
+    @Query('piso') piso = '',
+    @Query('prateleira') prateleira = '',
+  ) {
+    return this.service.listarColunas(empresa, piso, prateleira);
+  }
+
+  @Get('marcas-recorte')
+  @ApiOperation({
+    summary: 'Marcas existentes no recorte dos filtros da avulsa (encadeia o filtro de marca)',
+    description:
+      'Códigos de marca (MAR_CODIGO) com produto com saldo dentro do recorte de grupos, subgrupos ' +
+      'e/ou piso/prateleira/coluna. Todos os parâmetros aceitam lista separada por vírgula.'
+  })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiQuery({ name: 'grupo', required: false, example: '1,4', type: 'string' })
+  @ApiQuery({ name: 'subgrupo', required: false, example: '154', type: 'string' })
+  @ApiQuery({ name: 'piso', required: false, example: 'PISO_A,BOX', type: 'string' })
+  @ApiQuery({ name: 'prateleira', required: false, example: '12,14', type: 'string' })
+  @ApiQuery({ name: 'coluna', required: false, example: '3', type: 'string' })
+  async getMarcasRecorte(
+    @Query('empresa') empresa = '3',
+    @Query('grupo') grupo = '',
+    @Query('subgrupo') subgrupo = '',
+    @Query('piso') piso = '',
+    @Query('prateleira') prateleira = '',
+    @Query('coluna') coluna = '',
+  ) {
+    const nums = (v: string) =>
+      v.split(',').map((s) => s.trim()).filter(Boolean).map(Number).filter((n) => Number.isFinite(n));
+    return this.service.listarMarcasPorRecorte(empresa, {
+      grupos: grupo.trim() ? nums(grupo) : undefined,
+      subgrupos: subgrupo.trim() ? nums(subgrupo) : undefined,
+      pisos: piso.trim() ? piso.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      prateleiras: prateleira.trim() ? nums(prateleira) : undefined,
+      colunas: coluna.trim() ? nums(coluna) : undefined,
+    });
+  }
+
+  @Get('pendentes')
+  @ApiOperation({
+    summary: 'Listar itens pendentes de contagens avulsas',
+    description:
+      'Locações que ficaram fora do escopo de avulsas anteriores (produto multi-locação contado parcialmente), ' +
+      'ainda sem contagem, de sessões ativas. Uma nova avulsa pode adotá-los via itens_pendentes_ids no POST.'
+  })
+  @ApiOkResponse({ description: 'Lista de itens pendentes para adoção' })
+  async getItensPendentes() {
+    return this.service.listarItensPendentes();
   }
 
   @Get('grupos')
@@ -281,12 +369,14 @@ export class EstoqueSaidasController {
     @Query('pageSize') pageSize?: number,
     @Query('data') data?: string,
     @Query('piso') piso?: string,
+    @Query('tipo') tipo?: string,
   ): Promise<any> { // Changed return type to any for now to support pagination object
     return this.service.getAllContagens({
       page: page ? Number(page) : 1,
       pageSize: pageSize ? Number(pageSize) : 20,
       data,
-      piso
+      piso,
+      tipo: tipo ? Number(tipo) : undefined,
     });
   }
 

@@ -253,6 +253,9 @@ model est_contagem_itens {
   contagem_cuid      String
   aplicacoes         String?
   identificador_item String?            @db.VarChar
+  // Locação do produto que NÃO entrou no escopo desta contagem avulsa: o Celta não
+  // separa saldo por locação, então o produto só valida quando TODAS as locações
+  // forem contadas. As pendentes ficam aguardando uma avulsa complementar.
   pendente           Boolean            @default(false)
   logs               est_contagem_log[]
 

@@ -55,13 +55,48 @@ export class EstoqueSaidasService {
   async buscarProdutosPorFiltro(filters: {
     empresa: string;
     cod_produto?: number;
+    cod_produtos?: number[];
     marca?: number;
+    marcas?: number[];
     descricao?: string;
     grupo?: number;
+    grupos?: number[];
     subgrupo?: number;
+    subgrupos?: number[];
     somente_com_saldo?: boolean;
+    piso?: string;
+    prateleira?: number;
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchProdutosPorFiltro(filters);
+  }
+
+  /** Itens pendentes de outras contagens avulsas, disponíveis para adoção. */
+  async listarItensPendentes() {
+    return this.repo.getItensPendentes();
+  }
+
+  /** Prateleiras existentes no(s) piso(s) informado(s) (filtro-filho da avulsa). */
+  async listarPrateleiras(empresa: string, piso: string) {
+    return this.repo.fetchPrateleirasPorPiso(empresa, piso);
+  }
+
+  /** Colunas (prédio) existentes nos pisos/prateleiras (3º nível do filtro encadeado). */
+  async listarColunas(empresa: string, piso: string, prateleira?: string) {
+    return this.repo.fetchColunasPorFiltro(empresa, piso, prateleira);
+  }
+
+  /** Marcas com produto dentro do recorte atual (encadeia o filtro de marca). */
+  async listarMarcasPorRecorte(empresa: string, filtros: {
+    grupos?: number[];
+    subgrupos?: number[];
+    pisos?: string[];
+    prateleiras?: number[];
+    colunas?: number[];
+  }) {
+    return this.repo.fetchMarcasPorRecorte(empresa, filtros);
   }
 
   async listarGrupos(empresa: string) {
@@ -80,17 +115,23 @@ export class EstoqueSaidasService {
     try {
       const result = await this.repo.createContagem(createContagemDto);
 
-      await fetch('http://log-service.acacessorios.local/log', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          usuario: createContagemDto.usuario,
-          setor: 'Compras',
-          tela: 'Comparativo',
-          acao: 'Create',
-          descricao: `Criou contagem do colaborador ${createContagemDto.colaborador} com ${createContagemDto.produtos.length} produtos.`,
-        }),
-      });
+      // Auditoria é acessória: a contagem já está gravada — falha no log-service
+      // não pode transformar a criação num erro para quem chamou.
+      try {
+        await fetch('http://log-service.acacessorios.local/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            usuario: createContagemDto.usuario,
+            setor: 'Compras',
+            tela: 'Comparativo',
+            acao: 'Create',
+            descricao: `Criou contagem do colaborador ${createContagemDto.colaborador} com ${createContagemDto.produtos.length} produtos.`,
+          }),
+        });
+      } catch (logError) {
+        console.error('Falha ao registrar auditoria da contagem no log-service:', logError);
+      }
 
       return result;
     } catch (error) {
@@ -118,6 +159,11 @@ export class EstoqueSaidasService {
     return this.repo.getEstoqueProduto(codProduto, empresa);
   }
 
+  /** Saldo de vários produtos numa consulta em lote (mapa código -> estoque). */
+  async getEstoquePorProdutos(codigos: number[], empresa?: string): Promise<Map<number, number>> {
+    return this.repo.getEstoquePorProdutos(codigos, empresa);
+  }
+
   async updateLiberadoContagem(contagem_cuid: string, contagem: number, divergencia: boolean, itensParaRevalidar?: string[], data_fim?: string) {
     return this.repo.updateLiberadoContagem(contagem_cuid, contagem, divergencia, itensParaRevalidar, data_fim);
   }
@@ -133,7 +179,7 @@ export class EstoqueSaidasService {
     }));
   }
 
-  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string }) {
+  async getAllContagens(params?: { page?: number; pageSize?: number; data?: string; piso?: string; tipo?: number }) {
     return this.repo.getAllContagens(params);
   }
 

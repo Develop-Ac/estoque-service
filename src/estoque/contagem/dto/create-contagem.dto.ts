@@ -149,6 +149,32 @@ export class CreateContagemDto {
   @IsNumber()
   tipo?: number;
 
+  @ApiProperty({
+    description:
+      'IDs de itens PENDENTES de outras contagens avulsas a serem adotados por esta sessão. ' +
+      'O item muda de sessão (mantendo data e identificador) e deixa de ser pendente.',
+    required: false,
+    type: [String]
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  itens_pendentes_ids?: string[];
+
+  @ApiProperty({
+    description:
+      'Quantas rodadas o grupo terá (1 a 3, escolhidas na criação da avulsa). ' +
+      'Obrigatoriamente igual à da contagem principal quando a sessão adota itens pendentes: ' +
+      'rodadas não se misturam na consolidação, e uma complementar com menos rodadas deixaria ' +
+      'as rodadas seguintes da principal sem cobertura para sempre.',
+    example: 3,
+    enum: [1, 2, 3],
+    required: false
+  })
+  @IsOptional()
+  @IsNumber()
+  qtd_rodadas?: number;
+
   @IsString()
   usuario: string
 }

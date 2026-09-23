@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { EstoqueSaidasRepository } from './contagem.repository';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OpenQueryService } from '../../shared/database/openquery/openquery.service';
+import { ErpApiService } from '../../shared/erp-api/erp-api.service';
 import { CreateContagemDto } from './dto/create-contagem.dto';
 
 // Mock do crypto.randomUUID
@@ -49,6 +50,16 @@ describe('EstoqueSaidasRepository', () => {
     query: jest.fn(),
   };
 
+  /**
+   * Cliente da erp-firebird-api desligado: `habilitado: false` faz `comFallback`
+   * ir direto ao OPENQUERY, que é o caminho que estes testes verificam. Ligar a
+   * API aqui trocaria o objeto sob teste sem que os testes soubessem.
+   */
+  const mockErpApiService = {
+    habilitado: false,
+    comFallback: jest.fn(async (_viaApi: any, viaOpenQuery: any) => viaOpenQuery()),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -60,6 +71,10 @@ describe('EstoqueSaidasRepository', () => {
         {
           provide: OpenQueryService,
           useValue: mockOpenQueryService,
+        },
+        {
+          provide: ErpApiService,
+          useValue: mockErpApiService,
         },
       ],
     }).compile();
@@ -377,16 +392,20 @@ describe('EstoqueSaidasRepository', () => {
       mockPrismaService.sis_usuarios.findFirst.mockResolvedValue(mockUsuario);
       mockPrismaService.est_contagem_itens.findMany.mockResolvedValue([]);
 
-      // Mock da transação
+      // Mock da transação. findMany é chamado 3x: itens já existentes do grupo ([]),
+      // identificadores em uso ([]) e, após o createMany, os itens como ficaram no banco.
       mockPrismaService.$transaction.mockImplementation(async (callback) => {
         const txMock = {
           est_contagem: {
             create: jest.fn().mockResolvedValue(mockContagem),
           },
           est_contagem_itens: {
-            findMany: jest.fn().mockResolvedValue([]),
+            findMany: jest.fn()
+              .mockResolvedValueOnce([])
+              .mockResolvedValueOnce([])
+              .mockResolvedValue([mockItem]),
             count: jest.fn().mockResolvedValue(0), // slot livre p/ o identificador
-            create: jest.fn().mockResolvedValue(mockItem),
+            createMany: jest.fn().mockResolvedValue({ count: 1 }),
           },
         } as any;
         return callback(txMock as any);
@@ -431,9 +450,9 @@ describe('EstoqueSaidasRepository', () => {
           est_contagem_itens: {
             findMany: jest.fn().mockResolvedValue([]),
             count: jest.fn().mockResolvedValue(0), // nenhuma sessão anterior
-            create: jest.fn().mockImplementation(({ data }) => {
-              createdItems.push(data);
-              return Promise.resolve({ id: `item-${createdItems.length}`, ...data });
+            createMany: jest.fn().mockImplementation(({ data }) => {
+              createdItems.push(...data);
+              return Promise.resolve({ count: data.length });
             }),
           },
         } as any;

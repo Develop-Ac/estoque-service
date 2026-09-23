@@ -10,6 +10,18 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import * as https from 'https';
 
+/**
+ * Formato mínimo de arquivo enviado, compatível com o que multer/@fastify/multipart
+ * entregam. Substitui o antigo global Express.Multer.File (@types/multer),
+ * removido junto com o adapter Express.
+ */
+export type UploadedFile = {
+  originalname: string;
+  buffer: Buffer;
+  mimetype: string;
+  size?: number;
+};
+
 type S3Opts = {
   endpoint: string;
   region: string;
@@ -110,7 +122,7 @@ export class S3Service {
   }
 
   // Métodos adicionais para compatibilidade com os testes
-  async uploadFile(file: Express.Multer.File, prefix: string = ''): Promise<any> {
+  async uploadFile(file: UploadedFile, prefix: string = ''): Promise<any> {
     const key = `${prefix}${file.originalname}`;
     await this.putObject(key, file.buffer, file.mimetype);
     return {

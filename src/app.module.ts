@@ -8,6 +8,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { S3Module } from './storage/s3.module';
 import { EstoqueSaidasModule } from './estoque/contagem/contagem.module';
 import { AuditoriaModule } from './estoque/auditoria/auditoria.module';
+import { ErpApiModule } from './shared/erp-api/erp-api.module';
 import { ConfigModule } from '@nestjs/config';
 
 @Module({
@@ -17,7 +18,7 @@ import { ConfigModule } from '@nestjs/config';
     }),
     PrismaModule,
     S3Module,
-    S3Module,
+    ErpApiModule,
     EstoqueSaidasModule,
     AuditoriaModule,
 

@@ -651,3 +651,59 @@ npm run dev
 Desenvolvido com ❤️ pela equipe **AC Acessórios**
 
 </div>
+---
+
+## Leitura do ERP pela erp-firebird-api (agosto/2026)
+
+Até aqui, toda consulta ao Celta saía por `OPENQUERY(CONSULTA, ...)`: o SQL
+Server abre uma sessão no Firebird e devolve o resultado. Quando essa sessão
+trava — ou quando o linked server engasga — a contagem para junto, com o ERP
+saudável do outro lado.
+
+O estoque-service é o **segundo serviço a consumir a erp-firebird-api**, depois
+do fiscal-service.
+
+### Variáveis de ambiente
+
+```bash
+# Endereço da erp-firebird-api. VAZIO = tudo continua indo por OPENQUERY.
+ERP_API_URL=http://intranet_api-firebird-consulta:8014
+# Mesmo token dos outros serviços (header x-app-token).
+ERP_API_TOKEN=
+# Opcional. Default 60000.
+ERP_API_TIMEOUT_MS=60000
+```
+
+Toda chamada tem o caminho antigo como alternativa: se a API não responder, a
+leitura vai por OPENQUERY e o log diz o motivo (`ENOTFOUND`, `ECONNREFUSED`,
+certificado…). Depois de 3 falhas seguidas o cliente pausa 60s, para não pagar
+o timeout inteiro em cada consulta enquanto a API está fora.
+
+### O que passou a usar a API
+
+| Método (`contagem.repository.ts`) | Rota | Ganho |
+|---|---|---|
+| `fetchSaidas` | `/erp/lanctos-estoque/saidas` | a definição de saída fica num lugar só |
+| `fetchProdutosPorFiltro` | `/erp/produtos` | — |
+| `fetchGrupos` / `fetchSubgrupos` / `fetchMarcas` | `/erp/produtos-grupos`, `/erp/produtos-subgrupos`, `/erp/marcas` | cache de 5 min do outro lado: abrir a tela de filtro deixa de custar 3 consultas ao ERP |
+| `getEstoqueProduto` | `/erp/produtos` (`PRO_CODIGO:igual`) | **10 conferências simultâneas viram 1 consulta no Firebird** |
+
+O saldo é buscado pela consulta livre com `PRO_CODIGO:igual`, e não pela rota em
+lote: só o operador `igual` sobre coluna única entra no agrupamento do outro
+lado.
+
+### Correções nas consultas, independentes da API
+
+Valem também no caminho por OPENQUERY:
+
+* **`JOIN MARCAS` → `LEFT JOIN`** na rotativa e na avulsa. `MAR_CODIGO` é
+  opcional, e o INNER escondia **18.513 produtos** do cadastro da empresa 3 —
+  2.359 deles com saldo, e 101 com movimento só no mês de julho/2026. O INNER
+  também não era mais rápido (111ms contra 47ms): só sumia com linhas.
+* **`getEstoqueProduto` lê `PRODUTOS` direto.** Antes chegava a
+  `ESTOQUE_DISPONIVEL` por `LANCTOS_ESTOQUE` e `MARCAS`, os dois com INNER —
+  produto sem movimentação ou sem marca devolvia zero linhas, e a conferência
+  caía no snapshot antigo sem nenhum erro no log.
+
+Detalhe e medições em
+[erp-firebird-api/docs/ARMADILHAS-FIREBIRD.md](../erp-firebird-api/docs/ARMADILHAS-FIREBIRD.md).
