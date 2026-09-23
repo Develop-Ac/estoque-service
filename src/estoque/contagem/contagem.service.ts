@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { EstoqueSaidasRepository } from './contagem.repository';
 import { EstoqueSaidaRow } from './contagem.types';
 import { CreateContagemDto } from './dto/create-contagem.dto';
@@ -7,6 +7,7 @@ import { ConferirEstoqueResponseDto } from './dto/conferir-estoque-response.dto'
 import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
 import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
+import { dataOntem, filtrarVitrine } from './vitrine';
 
 @Injectable()
 export class EstoqueSaidasService {
@@ -19,6 +20,35 @@ export class EstoqueSaidasService {
     tipo?: number;
   }): Promise<EstoqueSaidaRow[]> {
     return this.repo.fetchSaidas(filters);
+  }
+
+  /**
+   * Peças da VITRINE com saída em um dia (padrão: ontem, fuso da empresa).
+   * Reaproveita a consulta da contagem diária (uma linha por locação) e mantém
+   * só as locações da vitrine (VITRINE, V<dígito>..., Vitrine Móvel VM...).
+   */
+  async listarVitrine(filters: { data?: string; empresa: string }): Promise<{
+    data: string;
+    total: number;
+    itens: EstoqueSaidaRow[];
+  }> {
+    const data = filters.data ?? dataOntem();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+      throw new BadRequestException('data deve ser YYYY-MM-DD');
+    }
+    const rows = await this.repo.fetchSaidas({
+      data_inicial: data,
+      data_final: data,
+      empresa: filters.empresa,
+      tipo: 1,
+    });
+    const itens = filtrarVitrine(rows).sort((a, b) => {
+      const la = (a.LOCALIZACAO ?? '').toUpperCase();
+      const lb = (b.LOCALIZACAO ?? '').toUpperCase();
+      if (la !== lb) return la < lb ? -1 : 1;
+      return a.COD_PRODUTO - b.COD_PRODUTO;
+    });
+    return { data, total: itens.length, itens };
   }
 
   // ===== CONTAGEM AVULSA =====

@@ -23,6 +23,7 @@ import { CreateLogDto } from './dto/create-log.dto';
 import { LogResponseDto } from './dto/log-response.dto';
 import { UpdateGrupoContagemDto } from './dto/update-grupo-contagem.dto';
 import { BuscarProdutosQueryDto } from './dto/buscar-produtos.query.dto';
+import { GetVitrineQueryDto } from './dto/get-vitrine.query.dto';
 
 @ApiTags('Estoque')
 @ApiExtraModels(GetSaidasQueryDto, EstoqueSaidaResponseDto, CreateContagemDto, ContagemResponseDto, UpdateConferirDto, ConferirEstoqueResponseDto, UpdateLiberadoContagemDto, CreateLogDto, LogResponseDto)
@@ -159,6 +160,47 @@ export class EstoqueSaidasController {
   @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
   async getMarcas(@Query('empresa') empresa = '3') {
     return this.service.listarMarcas(empresa);
+  }
+
+  @Get('vitrine')
+  @ApiOperation({
+    summary: 'Peças da vitrine com saída no dia',
+    description:
+      'Lista as saídas de estoque de UM dia (padrão: ontem, fuso America/Sao_Paulo) ' +
+      'apenas para as locações da vitrine (VITRINE, V<dígito>... e Vitrine Móvel VM...). ' +
+      'Mesma fonte da contagem diária (lanctos_estoque), já explodida por locação.'
+  })
+  @ApiQuery({ name: 'data', required: false, example: '2026-09-22', type: 'string', description: 'YYYY-MM-DD (padrão: ontem)' })
+  @ApiQuery({ name: 'empresa', required: false, example: '3', type: 'string' })
+  @ApiOkResponse({
+    description: 'Dia consultado, total de linhas e itens da vitrine',
+    example: {
+      data: '2026-09-22',
+      total: 1,
+      itens: [
+        {
+          DATA: '2026-09-22T00:00:00.000Z',
+          COD_PRODUTO: 18068,
+          DESC_PRODUTO: 'PALHETA SCANIA SERIE 4 / 5 27 ONIBUS',
+          MAR_DESCRICAO: 'VTO / TESLLA',
+          REF_FABRICANTE: 'PVC2768',
+          REF_FORNECEDOR: 'PVC2768',
+          LOCALIZACAO: 'V101B10',
+          UNIDADE: 'UN',
+          APLICACOES: null,
+          CODIGO_BARRAS: '7898422624996',
+          QTDE_SAIDA: 2,
+          ESTOQUE: 14,
+          RESERVA: 0
+        }
+      ]
+    }
+  })
+  @ApiBadRequestResponse({ description: 'Data ou empresa inválidas' })
+  async getVitrine(@Query() q: GetVitrineQueryDto) {
+    const empresa = q.empresa && String(q.empresa).trim() !== '' ? String(q.empresa) : '3';
+    const data = q.data && String(q.data).trim() !== '' ? String(q.data) : undefined;
+    return this.service.listarVitrine({ data, empresa });
   }
 
   @Get('lista')
