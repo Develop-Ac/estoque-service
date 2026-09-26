@@ -429,6 +429,16 @@ export class AuditoriaService {
                 s => !!s.rodada1?.data_fim && !s.rodadas.some(g => g.liberado_contagem),
             );
 
+            // Data da contagem para o relatório de auditoria = conclusão da ÚLTIMA
+            // rodada concluída, considerando todas as sessões do grupo. Nula enquanto
+            // nenhuma rodada foi concluída (a auditoria pode rodar antes disso).
+            let dataFim: Date | null = null;
+            for (const s of sessoes) {
+                for (const g of s.rodadas) {
+                    if (g.data_fim && (!dataFim || g.data_fim > dataFim)) dataFim = g.data_fim;
+                }
+            }
+
             result.push({
                 contagem_cuid: principal.cuid,
                 nome: nomes[0] ?? null,
@@ -437,6 +447,7 @@ export class AuditoriaService {
                 total_sessoes: sessoes.length,
                 created_at: principal.rodada1?.created_at ?? null,
                 data_itens: dataItens,
+                data_fim: dataFim,
                 total_produtos: produtos.size,
                 produtos_divergentes: divergentes.size,
                 produtos_aguardando: aguardando.size,
