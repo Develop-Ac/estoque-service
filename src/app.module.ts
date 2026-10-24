@@ -9,6 +9,7 @@ import { S3Module } from './storage/s3.module';
 import { EstoqueSaidasModule } from './estoque/contagem/contagem.module';
 import { AuditoriaModule } from './estoque/auditoria/auditoria.module';
 import { ErpApiModule } from './shared/erp-api/erp-api.module';
+import { ConciliacaoModule } from './estoque/conciliacao/conciliacao.module';
 import { ConfigModule } from '@nestjs/config';
 
 @Module({
@@ -21,6 +22,7 @@ import { ConfigModule } from '@nestjs/config';
     ErpApiModule,
     EstoqueSaidasModule,
     AuditoriaModule,
+    ConciliacaoModule,
 
     PrometheusModule.register({
       defaultMetrics: { enabled: true }, // CPU, memória, event loop, GC
@@ -29,6 +31,7 @@ import { ConfigModule } from '@nestjs/config';
     // ⬇️ Prefixa *somente* esses módulos com /compras
     RouterModule.register([
       { path: 'estoque', module: EstoqueSaidasModule },
+      { path: 'estoque', module: ConciliacaoModule },
     ]),
   ],
   controllers: [AppController],

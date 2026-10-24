@@ -215,6 +215,33 @@ export class ErpApiService {
     }
   }
 
+  /**
+   * Consulta livre do catálogo (`POST /erp/<recurso>/consulta`), com o corpo no
+   * formato da API (campos com `como`, filtros com `ou`, ordenar, limite).
+   *
+   * Devolve também o `meta`: quem chama decide o que fazer com `truncado`, porque
+   * para uns é aviso e para outros é filtro grande demais.
+   */
+  async consultar<T = any>(recurso: string, corpo: Record<string, any>): Promise<{ dados: T[]; meta: RespostaErp['meta'] }> {
+    const caminho = `/erp/${recurso}/consulta`;
+    try {
+      const resposta = await fetch(this.base + caminho, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-app-token': this.token, 'x-servico': 'estoque-service' },
+        body: JSON.stringify(corpo),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      if (!resposta.ok) throw new Error(`HTTP ${resposta.status} em ${caminho}: ${(await resposta.text().catch(() => '')).slice(0, 300)}`);
+      const json = (await resposta.json()) as RespostaErp;
+      if (!json || !Array.isArray(json.dados)) throw new Error(`Resposta inesperada de ${caminho}`);
+      this.falhasSeguidas = 0;
+      return { dados: json.dados as T[], meta: json.meta };
+    } catch (erro: any) {
+      this.registrarFalha(caminho, erro);
+      throw erro;
+    }
+  }
+
   /* ------------------------------- consultas ------------------------------- */
 
   /**
