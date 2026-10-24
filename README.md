@@ -62,6 +62,10 @@ Este é o backend da aplicação de intranet da **AC Acessórios**, uma API REST
   - Controle de conferência por item
   - Agrupamento de contagens por CUID
   - Consulta de estoque via OpenQuery
+- **Conciliação de Estoque** (`/estoque/conciliacao`)
+  - Empresa 1 (fiscal) × empresa 3 (gerencial), só leitura
+  - Busca por grupo/subgrupo, por vendas (NFS) ou por operação + período (até 90 dias)
+  - Fonte principal: api-firebird-service (`ERP_FIREBIRD_URL`, `ERP_FIREBIRD_TOKEN`, `ERP_FIREBIRD_TIMEOUT_MS`, default 15000); qualquer falha cai para OpenQuery
 
 ### 🔧 Módulo de Oficina
 - **Checklists**
