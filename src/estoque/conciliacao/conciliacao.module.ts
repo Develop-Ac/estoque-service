@@ -7,6 +7,11 @@ import { OpenQueryConciliacaoFonte } from './fontes/openquery.fonte';
 
 @Module({
   controllers: [ConciliacaoController],
-  providers: [ConciliacaoService, ApiConciliacaoFonte, OpenQueryConciliacaoFonte, OpenQueryService],
+  providers: [
+    ConciliacaoService,
+    ApiConciliacaoFonte,
+    OpenQueryConciliacaoFonte,
+    OpenQueryService,
+  ],
 })
 export class ConciliacaoModule {}

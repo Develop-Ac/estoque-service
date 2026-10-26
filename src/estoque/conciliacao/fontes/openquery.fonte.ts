@@ -8,16 +8,19 @@ import {
   FiltroProdutos,
   GrupoRow,
   ItemNotaRow,
+  KardexRow,
   NotaRow,
   OperacaoRow,
   ProdutoRow,
   SaldoRow,
   SubgrupoRow,
+  TotalKardexRow,
 } from '../conciliacao.types';
 import { LimiteExcedidoError, porLotes } from './lotes';
 
 const LIMITE_NOTAS = 20_000;
 const LIMITE_PRODUTOS = 5_000;
+const LIMITE_KARDEX = 50_000;
 
 const DATE_RX = /^\d{4}-\d{2}-\d{2}$/;
 const OPF_RX = /^[A-Za-z0-9]{1,10}$/;
@@ -29,7 +32,8 @@ const OPF_RX = /^[A-Za-z0-9]{1,10}$/;
 function inteiros(valores: number[]): string {
   return valores
     .map((v) => {
-      if (!Number.isSafeInteger(v)) throw new Error(`Valor inválido para OPENQUERY: ${v}`);
+      if (!Number.isSafeInteger(v))
+        throw new Error(`Valor inválido para OPENQUERY: ${v}`);
       return String(v);
     })
     .join(',');
@@ -38,7 +42,8 @@ function inteiros(valores: number[]): string {
 function textos(valores: string[]): string {
   return valores
     .map((v) => {
-      if (!OPF_RX.test(v)) throw new Error(`Código inválido para OPENQUERY: ${v}`);
+      if (!OPF_RX.test(v))
+        throw new Error(`Código inválido para OPENQUERY: ${v}`);
       return `'${v}'`;
     })
     .join(',');
@@ -144,7 +149,11 @@ export class OpenQueryConciliacaoFonte implements ConciliacaoFonte {
   notasPorNfs(nfs: number[]): Promise<NotaRow[]> {
     return porLotes(nfs, (lote) =>
       this.consultar<NotaRow>(
-        [...SELECT_NOTA, `WHERE NFS.EMPRESA = ${EMPRESA_GERENCIAL}`, `    AND NFS.NFS IN (${inteiros(lote)})`],
+        [
+          ...SELECT_NOTA,
+          `WHERE NFS.EMPRESA = ${EMPRESA_GERENCIAL}`,
+          `    AND NFS.NFS IN (${inteiros(lote)})`,
+        ],
         'notas-nfs',
       ),
     );
@@ -166,7 +175,9 @@ export class OpenQueryConciliacaoFonte implements ConciliacaoFonte {
       'notas-periodo',
     );
     if (rows.length > LIMITE_NOTAS) {
-      throw new LimiteExcedidoError(`Mais de ${LIMITE_NOTAS} notas no filtro. Reduza o período ou as operações.`);
+      throw new LimiteExcedidoError(
+        `Mais de ${LIMITE_NOTAS} notas no filtro. Reduza o período ou as operações.`,
+      );
     }
     return rows;
   }
@@ -191,15 +202,21 @@ export class OpenQueryConciliacaoFonte implements ConciliacaoFonte {
     if (f.codigos?.length) {
       return porLotes(f.codigos, (lote) =>
         this.consultar<ProdutoRow>(
-          [...SELECT_PRODUTO, `WHERE PRO.EMPRESA = ${EMPRESA_GERENCIAL}`, `    AND PRO.PRO_CODIGO IN (${inteiros(lote)})`],
+          [
+            ...SELECT_PRODUTO,
+            `WHERE PRO.EMPRESA = ${EMPRESA_GERENCIAL}`,
+            `    AND PRO.PRO_CODIGO IN (${inteiros(lote)})`,
+          ],
           'produtos-codigos',
         ),
       );
     }
 
     const taxonomia: string[] = [];
-    if (f.subgrupos?.length) taxonomia.push(`PRO.SUBGRP_CODIGO IN (${inteiros(f.subgrupos)})`);
-    if (f.grupos?.length) taxonomia.push(`GRP.GRP_CODIGO IN (${inteiros(f.grupos)})`);
+    if (f.subgrupos?.length)
+      taxonomia.push(`PRO.SUBGRP_CODIGO IN (${inteiros(f.subgrupos)})`);
+    if (f.grupos?.length)
+      taxonomia.push(`GRP.GRP_CODIGO IN (${inteiros(f.grupos)})`);
     if (!taxonomia.length) return [];
 
     // Mesma paginação da fonte api, para não depender de um SELECT gigante.
@@ -236,6 +253,48 @@ export class OpenQueryConciliacaoFonte implements ConciliacaoFonte {
         ],
         'saldos-fiscal',
       ),
+    );
+  }
+
+  async kardex(
+    empresa: number,
+    codigo: number,
+    desde?: string,
+  ): Promise<KardexRow[]> {
+    const rows = await this.consultar<KardexRow>(
+      [
+        `SELECT FIRST ${LIMITE_KARDEX + 1}`,
+        '    L.LANCTO AS LANCTO, L.DATA AS DATA, CAST(L.HORA_SERVIDOR AS VARCHAR(8)) AS HORA_SERVIDOR,',
+        '    TRIM(L.ORIGEM) AS ORIGEM, L.OPERACAO AS OPERACAO, L.TIPO_ESTOQUE AS TIPO_ESTOQUE,',
+        '    L.QUANTIDADE AS QUANTIDADE, L.NFS AS NFS, L.NFS_ITEM AS NFS_ITEM, L.NFE AS NFE, L.NFE_ITEM AS NFE_ITEM,',
+        '    L.CONDICIONAL AS CONDICIONAL, L.ORDEM_SERVICO AS ORDEM_SERVICO, L.CONTAGEM_ESTOQUE AS CONTAGEM_ESTOQUE,',
+        '    L.USU_CODIGO AS USU_CODIGO, TRIM(L.MAQUINA) AS MAQUINA',
+        'FROM LANCTOS_ESTOQUE L',
+        `WHERE L.EMPRESA = ${inteiros([empresa])}`,
+        `    AND L.PRO_CODIGO = ${inteiros([codigo])}`,
+        ...(desde ? [`    AND L.DATA >= ${data(desde)}`] : []),
+        'ORDER BY L.DATA, L.LANCTO',
+      ],
+      'kardex',
+    );
+    if (rows.length > LIMITE_KARDEX) {
+      throw new LimiteExcedidoError(
+        `Mais de ${LIMITE_KARDEX} lançamentos do produto na empresa ${empresa}. Reduza o período.`,
+      );
+    }
+    return rows;
+  }
+
+  totaisKardex(empresa: number, codigo: number): Promise<TotalKardexRow[]> {
+    return this.consultar<TotalKardexRow>(
+      [
+        'SELECT L.OPERACAO AS OPERACAO, SUM(L.QUANTIDADE) AS TOTAL',
+        'FROM LANCTOS_ESTOQUE L',
+        `WHERE L.EMPRESA = ${inteiros([empresa])}`,
+        `    AND L.PRO_CODIGO = ${inteiros([codigo])}`,
+        'GROUP BY L.OPERACAO',
+      ],
+      'kardex-totais',
     );
   }
 }

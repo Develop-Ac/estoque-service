@@ -8,17 +8,39 @@ import {
   FiltroProdutos,
   GrupoRow,
   ItemNotaRow,
+  KardexRow,
   NotaRow,
   OperacaoRow,
   ProdutoRow,
   SaldoRow,
   SubgrupoRow,
+  TotalKardexRow,
 } from '../conciliacao.types';
 import { LimiteExcedidoError, porLotes } from './lotes';
 
 const LIMITE_NOTAS = 20_000;
 const LIMITE_ITENS = 50_000;
 const LIMITE_PRODUTOS = 5_000;
+const LIMITE_KARDEX = 50_000;
+
+const CAMPOS_KARDEX = [
+  'LANCTO',
+  'DATA',
+  'HORA_SERVIDOR',
+  'ORIGEM',
+  'OPERACAO',
+  'TIPO_ESTOQUE',
+  'QUANTIDADE',
+  'NFS',
+  'NFS_ITEM',
+  'NFE',
+  'NFE_ITEM',
+  'CONDICIONAL',
+  'ORDEM_SERVICO',
+  'CONTAGEM_ESTOQUE',
+  'USU_CODIGO',
+  'MAQUINA',
+];
 
 const CAMPOS_NOTA = [
   'NFS',
@@ -67,7 +89,12 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
   async subgrupos(): Promise<SubgrupoRow[]> {
     const r = await this.erp.consultar<SubgrupoRow>('produtos-subgrupos', {
       empresa: EMPRESA_GERENCIAL,
-      campos: ['SUBGRP_CODIGO', 'SUBGRP_DESCRICAO', 'GRP_CODIGO', { campo: 'grupo.GRP_DESCRICAO', como: 'GRP_DESCRICAO' }],
+      campos: [
+        'SUBGRP_CODIGO',
+        'SUBGRP_DESCRICAO',
+        'GRP_CODIGO',
+        { campo: 'grupo.GRP_DESCRICAO', como: 'GRP_DESCRICAO' },
+      ],
       ordenar: [{ campo: 'SUBGRP_DESCRICAO' }],
       limite: 5000,
     });
@@ -78,7 +105,14 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
     const r = await this.erp.consultar<OperacaoRow>('operacoes-fiscais', {
       empresa: EMPRESA_GERENCIAL,
       campos: ['OPF_CODIGO', 'OPF_DESCRICAO', 'CFOP'],
-      filtros: [{ ou: [{ campo: 'INATIVO', op: 'nulo' }, { campo: 'INATIVO', op: 'diferente', valor: 'S' }] }],
+      filtros: [
+        {
+          ou: [
+            { campo: 'INATIVO', op: 'nulo' },
+            { campo: 'INATIVO', op: 'diferente', valor: 'S' },
+          ],
+        },
+      ],
       ordenar: [{ campo: 'OPF_CODIGO' }],
       limite: 2000,
     });
@@ -102,7 +136,11 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
       empresa: EMPRESA_GERENCIAL,
       campos: CAMPOS_NOTA,
       filtros: [
-        { campo: 'DT_EMISSAO', op: 'entre', valor: [f.data_inicial, f.data_final] },
+        {
+          campo: 'DT_EMISSAO',
+          op: 'entre',
+          valor: [f.data_inicial, f.data_final],
+        },
         { campo: 'OPF_CODIGO', op: 'em', valor: f.operacoes },
         { campo: 'DT_CANCELAMENTO', op: 'nulo' },
         { campo: 'STATUS', op: 'diferente', valor: 3 },
@@ -111,7 +149,9 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
       limite: LIMITE_NOTAS,
     });
     if (r.meta?.truncado) {
-      throw new LimiteExcedidoError(`Mais de ${LIMITE_NOTAS} notas no filtro. Reduza o período ou as operações.`);
+      throw new LimiteExcedidoError(
+        `Mais de ${LIMITE_NOTAS} notas no filtro. Reduza o período ou as operações.`,
+      );
     }
     return r.dados;
   }
@@ -120,12 +160,20 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
     return porLotes(nfs, async (lote) => {
       const r = await this.erp.consultar<ItemNotaRow>('nfs-itens', {
         empresa: EMPRESA_GERENCIAL,
-        campos: ['NFS', 'PRO_CODIGO', 'QUANTIDADE', 'QTDE_DEVOLVIDA', { campo: 'nota.OPF_CODIGO', como: 'OPF_CODIGO' }],
+        campos: [
+          'NFS',
+          'PRO_CODIGO',
+          'QUANTIDADE',
+          'QTDE_DEVOLVIDA',
+          { campo: 'nota.OPF_CODIGO', como: 'OPF_CODIGO' },
+        ],
         filtros: [{ campo: 'NFS', op: 'em', valor: lote }],
         limite: LIMITE_ITENS,
       });
       if (r.meta?.truncado) {
-        throw new LimiteExcedidoError(`Mais de ${LIMITE_ITENS} itens em um lote de notas. Selecione menos notas.`);
+        throw new LimiteExcedidoError(
+          `Mais de ${LIMITE_ITENS} itens em um lote de notas. Selecione menos notas.`,
+        );
       }
       return r.dados;
     });
@@ -145,8 +193,10 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
     }
 
     const taxonomia: any[] = [];
-    if (f.subgrupos?.length) taxonomia.push({ campo: 'SUBGRP_CODIGO', op: 'em', valor: f.subgrupos });
-    if (f.grupos?.length) taxonomia.push({ campo: 'grupo.GRP_CODIGO', op: 'em', valor: f.grupos });
+    if (f.subgrupos?.length)
+      taxonomia.push({ campo: 'SUBGRP_CODIGO', op: 'em', valor: f.subgrupos });
+    if (f.grupos?.length)
+      taxonomia.push({ campo: 'grupo.GRP_CODIGO', op: 'em', valor: f.grupos });
     if (!taxonomia.length) return [];
 
     // Grupo grande passa do limite da tabela: pagina por PRO_CODIGO crescente.
@@ -156,7 +206,10 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
       const r = await this.erp.consultar<ProdutoRow>('produtos', {
         empresa: EMPRESA_GERENCIAL,
         campos: CAMPOS_PRODUTO,
-        filtros: [{ ou: taxonomia }, { campo: 'PRO_CODIGO', op: 'maior', valor: ultimo }],
+        filtros: [
+          { ou: taxonomia },
+          { campo: 'PRO_CODIGO', op: 'maior', valor: ultimo },
+        ],
         ordenar: [{ campo: 'PRO_CODIGO' }],
         limite: LIMITE_PRODUTOS,
       });
@@ -176,5 +229,43 @@ export class ApiConciliacaoFonte implements ConciliacaoFonte {
       });
       return r.dados;
     });
+  }
+
+  async kardex(
+    empresa: number,
+    codigo: number,
+    desde?: string,
+  ): Promise<KardexRow[]> {
+    const filtros: any[] = [
+      { campo: 'PRO_CODIGO', op: 'igual', valor: codigo },
+    ];
+    if (desde) filtros.push({ campo: 'DATA', op: 'maior_igual', valor: desde });
+    const r = await this.erp.consultar<KardexRow>('lanctos-estoque', {
+      empresa,
+      campos: CAMPOS_KARDEX,
+      filtros,
+      ordenar: [{ campo: 'DATA' }, { campo: 'LANCTO' }],
+      limite: LIMITE_KARDEX,
+    });
+    if (r.meta?.truncado) {
+      throw new LimiteExcedidoError(
+        `Mais de ${LIMITE_KARDEX} lançamentos do produto na empresa ${empresa}. Reduza o período.`,
+      );
+    }
+    return r.dados;
+  }
+
+  async totaisKardex(
+    empresa: number,
+    codigo: number,
+  ): Promise<TotalKardexRow[]> {
+    const r = await this.erp.consultar<TotalKardexRow>('lanctos-estoque', {
+      empresa,
+      filtros: [{ campo: 'PRO_CODIGO', op: 'igual', valor: codigo }],
+      agrupar: ['OPERACAO'],
+      agregar: [{ fn: 'somar', campo: 'QUANTIDADE', como: 'TOTAL' }],
+      limite: 10,
+    });
+    return r.dados;
   }
 }

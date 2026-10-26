@@ -67,6 +67,32 @@ export interface SaldoRow {
   ESTOQUE_RESERVADO: number | null;
 }
 
+/** Lançamento do kardex (LANCTOS_ESTOQUE) como as fontes devolvem. */
+export interface KardexRow {
+  LANCTO: number | string;
+  DATA: string | Date;
+  HORA_SERVIDOR: string | Date | null;
+  ORIGEM: string | null;
+  OPERACAO: string | null;
+  TIPO_ESTOQUE: number | null;
+  QUANTIDADE: number | string | null;
+  NFS: number | null;
+  NFS_ITEM: number | null;
+  NFE: number | null;
+  NFE_ITEM: number | null;
+  CONDICIONAL: number | null;
+  ORDEM_SERVICO: number | null;
+  CONTAGEM_ESTOQUE: number | null;
+  USU_CODIGO: number | null;
+  MAQUINA: string | null;
+}
+
+/** Σ QUANTIDADE do kardex inteiro do produto, por OPERACAO ('E'/'S'). */
+export interface TotalKardexRow {
+  OPERACAO: string | null;
+  TOTAL: number | string | null;
+}
+
 export interface FiltroProdutos {
   grupos?: number[];
   subgrupos?: number[];
@@ -93,6 +119,9 @@ export interface ConciliacaoFonte {
   itensDasNotas(nfs: number[]): Promise<ItemNotaRow[]>;
   produtosGerencial(filtro: FiltroProdutos): Promise<ProdutoRow[]>;
   saldosFiscal(codigos: number[]): Promise<SaldoRow[]>;
+  /** Kardex do produto na empresa, ordenado por DATA, LANCTO; `desde` (YYYY-MM-DD) corta por baixo, sem ele vem tudo. */
+  kardex(empresa: number, codigo: number, desde?: string): Promise<KardexRow[]>;
+  totaisKardex(empresa: number, codigo: number): Promise<TotalKardexRow[]>;
 }
 
 export type ModoConciliacao = 'grupo' | 'venda' | 'operacao';
