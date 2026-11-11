@@ -306,7 +306,9 @@ export class EstoqueSaidasController {
         colaborador: 'clx0987654321fedcba',
         contagem: 1,
         contagem_cuid: 'clx1234567890group',
+        numero: 120,
         liberado_contagem: true,
+        aguardando_outros_pisos: false,
         created_at: '2025-11-04T14:30:00.000Z',
         usuario: {
           id: 'clx0987654321fedcba',
@@ -411,6 +413,7 @@ export class EstoqueSaidasController {
         colaborador: 'clx0987654321fedcba',
         contagem: 1,
         contagem_cuid: 'clx1234567890group',
+        numero: 120,
         liberado_contagem: true,
         created_at: '2025-11-04T14:30:00.000Z',
         usuario: {
@@ -479,18 +482,21 @@ export class EstoqueSaidasController {
         id: 'clx1234567890type1',
         contagem: 1,
         contagem_cuid: 'clx1234567890group',
+        numero: 120,
         liberado_contagem: true
       },
       {
         id: 'clx1234567890type2',
         contagem: 2,
         contagem_cuid: 'clx1234567890group',
+        numero: 120,
         liberado_contagem: false
       },
       {
         id: 'clx1234567890type3',
         contagem: 3,
         contagem_cuid: 'clx1234567890group',
+        numero: 120,
         liberado_contagem: false
       }
     ]
@@ -563,6 +569,7 @@ export class EstoqueSaidasController {
     example: {
       id: 'clx1234567890abcdef',
       contagem_cuid: 'clx1234567890group',
+      numero: 120,
       contagem: 2,
       liberado_contagem: true
     }

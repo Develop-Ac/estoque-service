@@ -3,6 +3,10 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { EstoqueSaidasService } from '../contagem/contagem.service';
 import { consolidarProdutoDia } from '../contagem/consolidacao-produto';
 
+// Números de sessão (`est_contagem.numero`) para exibição: sem nulos, sem repetição, crescente.
+const numerosUnicos = (ns: (number | null | undefined)[]) =>
+    [...new Set(ns.filter((n): n is number => n != null))].sort((a, b) => a - b);
+
 @Injectable()
 export class AuditoriaService {
     constructor(
@@ -114,7 +118,8 @@ export class AuditoriaService {
                 },
                 select: {
                     contagem_cuid: true,
-                    piso: true
+                    piso: true,
+                    numero: true
                 }
             });
 
@@ -123,6 +128,13 @@ export class AuditoriaService {
             }
 
             const mainCuid = contagensFechadas[0].contagem_cuid;
+
+            // Números de todas as sessões DIÁRIAS com locação deste produto/dia (não só
+            // as que fecharam a 3ª): é o "Nº 120, 123" que a tela/relatório mostram.
+            const sessoesEnvolvidas = await this.prisma.est_contagem.findMany({
+                where: { contagem_cuid: { in: cuidsEnvolvidos }, status: 0, tipo: 1 },
+                select: { numero: true },
+            });
 
             // Verificar se já foi auditado
             let audetado = await this.prisma.est_auditoria.findFirst({
@@ -231,6 +243,8 @@ export class AuditoriaService {
 
             result.push({
                 contagem_cuid: mainCuid,
+                numero: contagemPrincipal?.numero ?? null,
+                numeros: numerosUnicos(sessoesEnvolvidas.map(s => s.numero)),
                 cod_produto,
                 desc_produto,
                 estoque_snapshot: estoqueSnapshot,
@@ -310,6 +324,7 @@ export class AuditoriaService {
                 contagem: true,
                 liberado_contagem: true,
                 piso: true,
+                numero: true,
                 created_at: true,
                 data_fim: true,
             },
@@ -441,6 +456,8 @@ export class AuditoriaService {
 
             result.push({
                 contagem_cuid: principal.cuid,
+                numero: principal.rodada1?.numero ?? null,
+                numeros: numerosUnicos(sessoes.map(s => s.rodada1?.numero)),
                 nome: nomes[0] ?? null,
                 // Nomes das sessões vinculadas (além da principal), sem repetição.
                 vinculadas: nomes.slice(1),
@@ -566,7 +583,7 @@ export class AuditoriaService {
         // ainda conta.
         const rodadasGrupo = await this.prisma.est_contagem.findMany({
             where: { contagem_cuid: { in: [...cuidsVisitados] }, status: 0 },
-            select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true, piso: true },
+            select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true, piso: true, numero: true },
         });
         const rodadasPorCuid = new Map<string, typeof rodadasGrupo>();
         for (const r of rodadasGrupo) {
@@ -586,10 +603,13 @@ export class AuditoriaService {
         const totalRodadasGrupo = Math.min(3, Math.max(1, ...rodadasGrupo.map(r => r.contagem)));
 
         // Nome (piso) da rodada 1 de cada sessão do fecho — para "sessões vinculadas".
+        // Idem para o número da sessão (igual nas 3 rodadas).
         const nomePorCuid = new Map<string, string | null>();
+        const numeroPorCuid = new Map<string, number | null>();
         for (const [cuid, rodadas] of rodadasPorCuid) {
             const r1 = rodadas.find(r => r.contagem === 1) ?? rodadas[0];
             nomePorCuid.set(cuid, r1?.piso ?? null);
+            numeroPorCuid.set(cuid, r1?.numero ?? null);
         }
 
         let systemUser = await this.prisma.sis_usuarios.findFirst({ where: { nome: 'SISTEMA' } });
@@ -737,6 +757,8 @@ export class AuditoriaService {
 
             result.push({
                 contagem_cuid: contagemCuid,
+                numero: numeroPorCuid.get(contagemCuid) ?? null,
+                numeros: numerosUnicos(cuidsEnvolvidos.map(c => numeroPorCuid.get(c))),
                 cod_produto: grupo.cod_produto,
                 desc_produto: grupo.desc_produto,
                 estoque_snapshot: estoqueSnapshot,

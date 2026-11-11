@@ -1118,12 +1118,27 @@ export class EstoqueSaidasRepository {
 
     // Usar transação para criar contagem e itens separadamente
     const contagemResult = await this.prisma.$transaction(async (tx) => {
+      // NÚMERO DA SESSÃO: as rodadas do mesmo cuid compartilham um número sequencial
+      // (est_contagem_numero_seq). Os POSTs das rodadas chegam juntos, então o lock
+      // por cuid serializa "ler o número da irmã, senão nextval" até o fim da transação.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${grupoContagem}))`;
+      const irmaNumerada = await tx.est_contagem.findFirst({
+        where: { contagem_cuid: grupoContagem, numero: { not: null } },
+        select: { numero: true },
+      });
+      let numero = irmaNumerada?.numero ?? null;
+      if (numero == null) {
+        const [{ n }] = await tx.$queryRaw<{ n: bigint }[]>`SELECT nextval('est_contagem_numero_seq') AS n`;
+        numero = Number(n);
+      }
+
       // Criar a contagem sem itens primeiro
       const contagem = await tx.est_contagem.create({
         data: {
           colaborador: usuario.id,
           contagem: tipoContagem,
           contagem_cuid: grupoContagem,
+          numero,
           // true se contagem for 1, false para demais valores
           liberado_contagem: tipoContagem === 1,
           // 'piso' guarda o NOME da contagem (para avulsa, já vem com prefixo "AVULSA - ").
@@ -1949,7 +1964,20 @@ export class EstoqueSaidasRepository {
     // mesmo produto está em outro piso/sessão, essa visão é parcial nos dois sentidos:
     //  - pode acusar divergência que a outra locação já resolveu (aí NÃO se libera nada);
     //  - pode dar tudo certo aqui e faltar locação lá (aí a divergência continua valendo).
-    const { algumProdutoDivergente, temItens } = await this.reconciliarProdutosDaSessao(contagem_cuid);
+    const { algumProdutoDivergente, temItens, tipo } = await this.reconciliarProdutosDaSessao(contagem_cuid);
+
+    // Diária: a rodada seguinte respeita a trava entre pisos (todas as sessões do dia).
+    if (temItens && tipo === 1) {
+      const liberados = await this.liberarRodadaSeguinteDoDia(contagem_cuid, Number(contagem));
+      if (!algumProdutoDivergente) await this.revogarLiberacoesSemDivergencia(contagem_cuid);
+      const liberouEsta = liberados.includes(contagem_cuid);
+      return await this.prisma.est_contagem.findFirst({
+        where: {
+          contagem_cuid: contagem_cuid,
+          contagem: liberouEsta ? Number(contagem) + 1 : contagem,
+        },
+      });
+    }
 
     const temDivergenciaReal = temItens ? algumProdutoDivergente : divergencia;
 
@@ -2031,7 +2059,7 @@ export class EstoqueSaidasRepository {
    */
   private async reconciliarProdutosDaSessao(
     contagem_cuid: string,
-  ): Promise<{ algumProdutoDivergente: boolean; temItens: boolean }> {
+  ): Promise<{ algumProdutoDivergente: boolean; temItens: boolean; tipo?: number }> {
     const itens = await this.prisma.est_contagem_itens.findMany({
       where: { contagem_cuid: contagem_cuid },
       select: { id: true, cod_produto: true, data: true },
@@ -2099,7 +2127,88 @@ export class EstoqueSaidasRepository {
       await this.revogarLiberacoesSemDivergencia(cuidIrmao);
     }
 
-    return { algumProdutoDivergente, temItens: true };
+    return { algumProdutoDivergente, temItens: true, tipo: tipoSessao };
+  }
+
+  /**
+   * Rodadas ativas das sessões DIÁRIAS (tipo 1) ligadas à sessão de referência por
+   * alguma data de item em comum — todos os pisos do dia. O fechamento é transitivo:
+   * uma diária pode cobrir mais de uma data (sábado e domingo), e as sessões de cada
+   * data entram no mesmo grupo. Assim o grupo é o mesmo seja qual for a sessão avaliada.
+   */
+  private async rodadasDiariasDoDia(cuidReferencia: string) {
+    const datas = new Set<string>();
+    const cuids = new Set<string>([cuidReferencia]);
+    // A referência sempre semeia as datas: na exclusão ela já está com status 1 e é
+    // justamente o dia dela que precisa ser reavaliado.
+    let fontes = [cuidReferencia];
+    while (fontes.length > 0) {
+      const itens = await this.prisma.est_contagem_itens.findMany({
+        where: { contagem_cuid: { in: fontes } },
+        select: { data: true },
+        distinct: ['data'],
+      });
+      const novos: string[] = [];
+      for (const data of new Set(itens.map((i) => i.data.toISOString().slice(0, 10)))) {
+        if (datas.has(data)) continue;
+        datas.add(data);
+        for (const cuid of await this.findContagemCuidsByDate(data)) {
+          if (!cuids.has(cuid)) {
+            cuids.add(cuid);
+            novos.push(cuid);
+          }
+        }
+      }
+      if (novos.length === 0) break;
+      // Só diárias ativas propagam o grupo; avulsa ou excluída não junta dias.
+      const ativas = await this.prisma.est_contagem.findMany({
+        where: { contagem_cuid: { in: novos }, status: 0, tipo: 1 },
+        select: { contagem_cuid: true },
+        distinct: ['contagem_cuid'],
+      });
+      fontes = ativas.map((a) => a.contagem_cuid).filter((c): c is string => !!c);
+    }
+
+    return this.prisma.est_contagem.findMany({
+      where: { contagem_cuid: { in: [...cuids] }, status: 0, tipo: 1 },
+      select: { contagem_cuid: true, contagem: true, liberado_contagem: true, data_fim: true },
+    });
+  }
+
+  /**
+   * Trava entre pisos da contagem diária: a rodada N+1 só é liberada quando nenhuma
+   * sessão do dia está com a rodada N aberta. Quando a última conclui, todas as sessões
+   * que concluíram N e seguem com divergência ganham a N+1 de uma vez.
+   */
+  /** Devolve os cuids que ganharam a rodada seguinte (vazio enquanto houver piso aberto). */
+  private async liberarRodadaSeguinteDoDia(cuidReferencia: string, rodada: number): Promise<string[]> {
+    const linhas = await this.rodadasDiariasDoDia(cuidReferencia);
+    const daRodada = linhas.filter((l) => l.contagem === rodada);
+    if (daRodada.some((l) => l.liberado_contagem)) return [];
+
+    const liberar: string[] = [];
+    // ponytail: custo = sessões do dia x produtos de cada uma; restringir às sessões
+    // com produto em comum com a de referência se a conclusão ficar lenta.
+    for (const cuid of new Set(linhas.map((l) => l.contagem_cuid).filter((c): c is string => !!c))) {
+      // A sessão de referência já foi reconciliada por quem chamou.
+      if (cuid !== cuidReferencia) await this.reconciliarProdutosDaSessao(cuid);
+      const r = daRodada.find((l) => l.contagem_cuid === cuid);
+      const divergentes = await this.prisma.est_contagem_itens.count({
+        where: { contagem_cuid: cuid, conferir: true },
+      });
+      // Só quem concluiu a rodada e segue com divergência ganha a seguinte.
+      if (r?.data_fim && !r.liberado_contagem && divergentes > 0) liberar.push(cuid);
+    }
+
+    if (liberar.length > 0) {
+      // data_fim: null — nunca reabre uma rodada N+1 que já foi concluída (sessão criada
+      // depois que as outras já fizeram a N+1).
+      await this.prisma.est_contagem.updateMany({
+        where: { contagem_cuid: { in: liberar }, contagem: rodada + 1, status: 0, data_fim: null },
+        data: { liberado_contagem: true },
+      });
+    }
+    return liberar;
   }
 
   /**
@@ -2156,7 +2265,8 @@ export class EstoqueSaidasRepository {
             nome: true,
             codigo: true
           }
-        }
+        },
+        _count: { select: { logs: true } }
       },
       orderBy: {
         contagem: 'asc' // Ordena por tipo: 1, 2, 3
@@ -2174,8 +2284,10 @@ export class EstoqueSaidasRepository {
     });
 
     // Adicionar os mesmos itens a todas as contagens do grupo
-    const contagensComItens = contagens.map(contagem => ({
+    // iniciada: a rodada já tem log (o contador não pode mais ser trocado)
+    const contagensComItens = contagens.map(({ _count, ...contagem }) => ({
       ...contagem,
+      iniciada: _count.logs > 0,
       itens: itens
     }));
 
@@ -2376,6 +2488,26 @@ export class EstoqueSaidasRepository {
       take: pageSize
     });
 
+    // Trava entre pisos: rodadas do dia e divergência buscadas uma vez por sessão da página.
+    const diaPorCuid = new Map<string, Promise<{ linhas: Awaited<ReturnType<typeof this.rodadasDiariasDoDia>>; divergente: boolean }>>();
+    const aguardandoOutrosPisos = async (c: (typeof contagens)[number]) => {
+      if (c.tipo !== 1 || (c.contagem !== 2 && c.contagem !== 3) || c.liberado_contagem || c.data_fim || !c.contagem_cuid) {
+        return false;
+      }
+      const cuid = c.contagem_cuid;
+      if (!diaPorCuid.has(cuid)) {
+        diaPorCuid.set(cuid, (async () => {
+          // Sessão sem divergência nunca espera: nem consulta o dia (é a maioria da lista).
+          const divergente = (await this.prisma.est_contagem_itens.count({ where: { contagem_cuid: cuid, conferir: true } })) > 0;
+          return { divergente, linhas: divergente ? await this.rodadasDiariasDoDia(cuid) : [] };
+        })());
+      }
+      const { linhas, divergente } = await diaPorCuid.get(cuid)!;
+      const anteriores = linhas.filter((l) => l.contagem === c.contagem - 1);
+      const propria = anteriores.find((l) => l.contagem_cuid === cuid);
+      return divergente && !!propria?.data_fim && !propria.liberado_contagem && anteriores.some((l) => l.liberado_contagem);
+    };
+
     // Precisamos buscar os ITENS para exibir a data correta no frontend
     // O frontend quer exibir a data do item, não a de criação.
     // Vamos buscar o primeiro item de cada contagem para pegar a data.
@@ -2404,6 +2536,8 @@ export class EstoqueSaidasRepository {
       return {
         ...c,
         grupo_iniciado: grupoIniciado, // Nova propriedade
+        // Rodada 2/3 de contagem diária esperando outro piso do dia concluir a rodada anterior.
+        aguardando_outros_pisos: await aguardandoOutrosPisos(c),
         itens: primeiroItem ? [{ data: primeiroItem.data }] : [] // Mock items array with just date
       };
     }));
@@ -2494,6 +2628,20 @@ export class EstoqueSaidasRepository {
         // do fantasma impediam qualquer rodada de fechar). Reavalia essas sessões para
         // limpar `conferir` e recolher rodadas liberadas sem necessidade.
         await this.reavaliarSessoesVizinhas(contagemAlvo.contagem_cuid);
+
+        // Contagem diária: o grupo excluído pode ser o piso que segurava a rodada do dia.
+        // Reavalia a trava entre pisos com as datas dos itens dele (a exclusão é lógica;
+        // a própria sessão já fica fora por status 0).
+        if (contagemAlvo.tipo === 1) {
+          for (const rodada of [1, 2]) {
+            try {
+              await this.liberarRodadaSeguinteDoDia(contagemAlvo.contagem_cuid, rodada);
+            } catch (e) {
+              // Reavaliação é saneamento: falhar aqui não pode desfazer a exclusão.
+              console.error(`[EXCLUSAO] Falha ao liberar a rodada ${rodada + 1} do dia após exclusão de ${contagemAlvo.contagem_cuid}`, e);
+            }
+          }
+        }
 
         return resultado;
       }
@@ -2597,28 +2745,47 @@ export class EstoqueSaidasRepository {
       (c) => Array.isArray(c.logs) && c.logs.length > 0,
     );
 
-    if (grupoIniciado) {
-      throw new BadRequestException('Nao e possivel alterar. O grupo de contagens ja foi iniciado.');
-    }
-
     const colaboradorPorContagem: Record<number, string | undefined> = {
       1: data.contagem1UsuarioId,
       2: data.contagem2UsuarioId,
       3: data.contagem3UsuarioId,
     };
 
-    const updates = grupoContagens.map((contagem) => {
+    // Trava por rodada: a rodada que já tem log fica com o contador e o nome;
+    // as rodadas ainda não iniciadas aceitam troca de contador. Valida tudo
+    // antes de gravar, para nada ser salvo se uma rodada recusar.
+    const alteracoes = grupoContagens.map((contagem) => {
+      const iniciada = Array.isArray(contagem.logs) && contagem.logs.length > 0;
       const novoColaborador = colaboradorPorContagem[contagem.contagem];
-      return this.prisma.est_contagem.update({
-        where: { id: contagem.id },
+      const trocaColaborador =
+        typeof novoColaborador !== 'undefined' && novoColaborador !== contagem.colaborador;
+      const trocaPiso = typeof data.piso !== 'undefined' && data.piso !== contagem.piso;
+
+      if (iniciada && trocaColaborador) {
+        throw new BadRequestException(
+          `A ${contagem.contagem}ª contagem já foi iniciada: não é possível trocar o contador.`,
+        );
+      }
+      if (grupoIniciado && trocaPiso) {
+        throw new BadRequestException('A contagem já foi iniciada: não é possível alterar o nome.');
+      }
+
+      return {
+        id: contagem.id,
         data: {
-          ...(typeof data.piso !== 'undefined' ? { piso: data.piso } : {}),
-          ...(typeof novoColaborador !== 'undefined' ? { colaborador: novoColaborador } : {}),
+          ...(trocaPiso ? { piso: data.piso } : {}),
+          ...(trocaColaborador ? { colaborador: novoColaborador } : {}),
         },
-      });
+      };
     });
 
-    await this.prisma.$transaction(updates);
+    const updates = alteracoes
+      .filter((a) => Object.keys(a.data).length > 0)
+      .map((a) => this.prisma.est_contagem.update({ where: { id: a.id }, data: a.data }));
+
+    if (updates.length > 0) {
+      await this.prisma.$transaction(updates);
+    }
 
     return this.prisma.est_contagem.findMany({
       where: {

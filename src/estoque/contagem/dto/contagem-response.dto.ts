@@ -36,10 +36,32 @@ export class ContagemResponseDto {
   contagem_cuid!: string | null;
 
   @ApiProperty({
+    description: 'Número sequencial da sessão (o mesmo nas rodadas do mesmo contagem_cuid)',
+    example: 120,
+    nullable: true,
+    required: false
+  })
+  numero?: number | null;
+
+  @ApiProperty({
     description: 'Indica se a contagem está liberada (true quando contagem = 1, false para demais valores)',
     example: true
   })
   liberado_contagem!: boolean;
+
+  @ApiProperty({
+    description: 'Só em GET /contagem/lista: rodada 2/3 da contagem diária já ganha pela divergência, mas esperando outro piso do dia concluir a rodada anterior',
+    example: false,
+    required: false
+  })
+  aguardando_outros_pisos?: boolean;
+
+  @ApiProperty({
+    description: 'Só em GET /contagem/grupo/:cuid: a rodada já tem log (o contador não pode mais ser trocado)',
+    example: false,
+    required: false
+  })
+  iniciada?: boolean;
 
   @ApiProperty({
     description: 'Data de criação da contagem',

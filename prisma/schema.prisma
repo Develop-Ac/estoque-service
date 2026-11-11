@@ -229,6 +229,7 @@ model est_contagem {
   tipo              Int                @default(1)
   data_inicio       DateTime?
   data_fim          DateTime?
+  numero            Int?
   usuario           sis_usuarios       @relation(fields: [colaborador], references: [id])
   logs              est_contagem_log[]
 
